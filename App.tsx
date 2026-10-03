@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Animated,
   Easing,
+  Keyboard,
   Modal,
   PanResponder,
   PermissionsAndroid,
@@ -47,6 +48,23 @@ const C = {
   red: '#e05252',
 };
 const MONO = 'monospace'; // swap for Azeret Mono once the font is bundled
+
+// Android system-bar inset (3-button / gesture nav). React Native core has no inset API on Android
+// (its SafeAreaView is a no-op there), so use react-native-safe-area-context when it is installed.
+// If it is not installed this quietly falls back to 0 and the app behaves exactly as before.
+let SafeArea: any = null;
+try {
+  SafeArea = require('react-native-safe-area-context');
+} catch {}
+const useBottomInset: () => number = SafeArea ? () => SafeArea.useSafeAreaInsets().bottom : () => 0;
+
+// one-line context around the first match, for search results that matched on transcript text
+function snippetFor(text: string, q: string): string {
+  const i = text.toLowerCase().indexOf(q);
+  if (i < 0) return '';
+  const start = Math.max(0, i - 24);
+  return (start > 0 ? '…' : '') + text.slice(start, i + q.length + 40).replace(/\s+/g, ' ') + '…';
+}
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -169,7 +187,8 @@ function MenuRow(p: { icon: string; title: string; sub: string; onPress: () => v
   );
 }
 
-export default function App() {
+function AppContent() {
+  const bottomInset = useBottomInset();
   const [status, setStatus] = useState('Ready');
   const [text, setText] = useState(''); // live preview only
   const [loading, setLoading] = useState(false);
@@ -187,6 +206,9 @@ export default function App() {
   const [renaming, setRenaming] = useState<Entry | null>(null);
   const [draftName, setDraftName] = useState('');
   const [sheetExpanded, setSheetExpanded] = useState(false); // transcript sheet: settled state (drag or tap the handle)
+  const [searchOpen, setSearchOpen] = useState(false);
+  const [query, setQuery] = useState('');
+  const [kbOpen, setKbOpen] = useState(false);
 
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
@@ -223,6 +245,7 @@ export default function App() {
   const sheetH = useRef(new Animated.Value(SHEET_MIN)).current;
   const sheetHVal = useRef(SHEET_MIN); // latest height, kept in sync by the listener below
   const dragStartH = useRef(SHEET_MIN);
+  const dragStartExpanded = useRef(false);
 
   useEffect(() => {
     const id = sheetH.addListener(({ value }) => {
@@ -247,6 +270,8 @@ export default function App() {
   };
 
   // Only attached to the handle, so it never competes with the transcript ScrollView.
+  // Every drag starts from the sheet's current height (dragStartH) and applies the gesture's total dy
+  // to it, clamped between collapsed and expanded, so nothing accumulates across gestures.
   const sheetPan = useMemo(
     () =>
       PanResponder.create({
@@ -255,7 +280,9 @@ export default function App() {
         onPanResponderTerminationRequest: () => false,
         onPanResponderGrant: () => {
           sheetH.stopAnimation();
+          const { min, max } = boundsRef.current;
           dragStartH.current = sheetHVal.current;
+          dragStartExpanded.current = sheetHVal.current > (min + max) / 2;
         },
         onPanResponderMove: (_, g) => {
           const { min, max } = boundsRef.current;
@@ -263,9 +290,20 @@ export default function App() {
           sheetH.setValue(Math.max(min, Math.min(max, dragStartH.current - g.dy)));
         },
         onPanResponderRelease: (_, g) => {
-          if (Math.abs(g.dy) < 8) toggleSheet(); // plain tap
-          else if (Math.abs(g.vy) > 0.3) snapSheet(g.vy < 0); // fling
-          else snapSheet(g.dy < 0); // short swipe: direction decides
+          const { min, max } = boundsRef.current;
+          if (Math.abs(g.dx) < 6 && Math.abs(g.dy) < 6) {
+            toggleSheet(); // plain tap
+            return;
+          }
+          // a real flick decides by direction, but only if it also travelled a meaningful distance
+          if (Math.abs(g.vy) > 0.5 && Math.abs(g.dy) > 24) {
+            snapSheet(g.vy < 0);
+            return;
+          }
+          // otherwise it has to be dragged far enough to switch state (hysteresis), so small accidental
+          // movements fall back to where the sheet started
+          const progress = (sheetHVal.current - min) / (max - min);
+          snapSheet(dragStartExpanded.current ? progress > 0.7 : progress > 0.3);
         },
         onPanResponderTerminate: () => {
           const { min, max } = boundsRef.current;
@@ -289,6 +327,30 @@ export default function App() {
       .then(i => setFreeHrs(i.freeSpace / BYTES_PER_SEC / 3600))
       .catch(() => {});
   }, [recording, entries.length]);
+
+  // search: hide the bottom nav while the keyboard is up so it doesn't ride on top of it
+  useEffect(() => {
+    const a = Keyboard.addListener('keyboardDidShow', () => setKbOpen(true));
+    const b = Keyboard.addListener('keyboardDidHide', () => setKbOpen(false));
+    return () => {
+      a.remove();
+      b.remove();
+    };
+  }, []);
+
+  const q = searchOpen ? query.trim().toLowerCase() : '';
+  const visible = useMemo(
+    () => (q ? entries.filter(e => e.title.toLowerCase().includes(q) || e.text.toLowerCase().includes(q)) : entries),
+    [entries, q],
+  );
+  const toggleSearch = () => {
+    setSearchOpen(v => !v);
+    setQuery('');
+  };
+  const openEntry = (e: Entry) => {
+    Keyboard.dismiss();
+    setSelected(e);
+  };
 
   const nextName = () => `untitled-${String(entries.length + 1).padStart(4, '0')}`;
 
@@ -535,27 +597,15 @@ export default function App() {
 
   const isError = status.startsWith('Error');
 
+  // rename dialog: compare against the name the dialog opened with (renaming.title)
+  const trimmedDraft = draftName.trim();
+  const nameChanged = trimmedDraft.length > 0 && trimmedDraft !== (renaming?.title ?? '');
+
   return (
     <SafeAreaView style={s.container}>
       <StatusBar barStyle="light-content" backgroundColor={C.canvas} />
 
-      {/* Header */}
-      <View style={s.header}>
-        <Text style={[s.mono10, { letterSpacing: 2, fontWeight: '500' }]}>TRANSCRIBE</Text>
-        <View style={s.headerRight}>
-          <Text style={s.mono10}>↓ OFFLINE</Text>
-          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 2 }}>
-            {[1, 2, 3, 4].map(b => (
-              <View
-                key={b}
-                style={{ width: 3, height: 8 + b * 2, borderRadius: 1, backgroundColor: b <= 3 ? C.text : C.faint }}
-              />
-            ))}
-          </View>
-        </View>
-      </View>
-
-      <ScrollView contentContainerStyle={{ paddingBottom: 24 }}>
+      <ScrollView contentContainerStyle={{ paddingTop: 8, paddingBottom: 24 }} keyboardShouldPersistTaps="handled">
         {/* Record panel */}
         <View
           style={[
@@ -617,15 +667,51 @@ export default function App() {
 
         {/* Recent */}
         <View style={{ paddingHorizontal: 16, marginTop: 24 }}>
-          <Text style={[s.mono10, { letterSpacing: 2, fontWeight: '500', marginBottom: 12 }]}>RECENT</Text>
+          <View style={s.recentHead}>
+            <Text style={[s.mono10, { letterSpacing: 2, fontWeight: '500' }]}>RECENT</Text>
+            {entries.length > 0 && (
+              <Pressable
+                onPress={toggleSearch}
+                style={s.exportBtn}
+                accessibilityLabel={searchOpen ? 'Close search' : 'Search transcripts'}
+              >
+                <Text style={[s.mono9, { color: C.amber }]}>{searchOpen ? '✕ CLOSE' : '⌕ SEARCH'}</Text>
+              </Pressable>
+            )}
+          </View>
+          {searchOpen && (
+            <View style={s.searchBox}>
+              <Text style={{ color: C.muted, fontSize: 14 }}>⌕</Text>
+              <TextInput
+                value={query}
+                onChangeText={setQuery}
+                autoFocus
+                autoCorrect={false}
+                autoCapitalize="none"
+                returnKeyType="search"
+                placeholder="Search names and text"
+                placeholderTextColor={C.muted}
+                style={s.searchInput}
+                accessibilityLabel="Search transcripts"
+              />
+              {!!query && (
+                <Pressable onPress={() => setQuery('')} hitSlop={10} accessibilityLabel="Clear search">
+                  <Text style={{ color: C.muted, fontSize: 14 }}>✕</Text>
+                </Pressable>
+              )}
+            </View>
+          )}
           {entries.length === 0 && (
             <Text style={s.empty}>No transcripts yet. Tap the record button to make your first one.</Text>
           )}
+          {entries.length > 0 && visible.length === 0 && (
+            <Text style={s.empty}>No transcripts match “{query.trim()}”.</Text>
+          )}
           <View style={{ gap: 8 }}>
-            {entries.map(e => (
+            {visible.map(e => (
               <Pressable
                 key={e.id}
-                onPress={() => setSelected(e)}
+                onPress={() => openEntry(e)}
                 style={({ pressed }) => [s.card, pressed && { borderColor: C.faint }]}
               >
                 <Text style={s.cardTitle} numberOfLines={1}>
@@ -634,6 +720,11 @@ export default function App() {
                 <Text style={[s.mono9, { marginTop: 6 }]}>
                   {e.duration} · {e.words.toLocaleString()} WORDS
                 </Text>
+                {!!q && !e.title.toLowerCase().includes(q) && (
+                  <Text style={[s.mono9, { marginTop: 6, color: C.text }]} numberOfLines={2}>
+                    {snippetFor(e.text, q)}
+                  </Text>
+                )}
               </Pressable>
             ))}
           </View>
@@ -641,7 +732,8 @@ export default function App() {
       </ScrollView>
 
       {/* Bottom nav */}
-      <View style={s.nav}>
+      {!(kbOpen && searchOpen) && (
+      <View style={[s.nav, { paddingBottom: 16 + bottomInset }]}>
         <View style={s.navItem}>
           <Text style={{ color: C.amber, fontSize: 16 }}>▤</Text>
           <Text style={[s.mono9, { color: C.amber, letterSpacing: 1 }]}>HOME</Text>
@@ -658,6 +750,7 @@ export default function App() {
           <Text style={[s.mono9, { letterSpacing: 1 }]}>SETTINGS</Text>
         </Pressable>
       </View>
+      )}
 
       {/* Add audio menu */}
       <Modal
@@ -738,15 +831,21 @@ export default function App() {
                 autoCorrect={false}
                 autoCapitalize="none"
                 returnKeyType="done"
-                onSubmitEditing={() => confirmRename(false)}
+                onSubmitEditing={() => confirmRename(!nameChanged)}
                 placeholderTextColor={C.muted}
                 style={s.input}
                 accessibilityLabel="Recording file name"
               />
             </View>
             <View style={s.btnRow}>
-              <Pressable style={[s.btn, { backgroundColor: C.amber }]} onPress={() => confirmRename(false)}>
-                <Text style={[s.btnText, { color: C.canvas }]}>KEEP NAME</Text>
+              <Pressable
+                style={[s.btn, { backgroundColor: nameChanged ? C.amber : C.faint }]}
+                onPress={() => confirmRename(!nameChanged)}
+                accessibilityLabel={nameChanged ? 'Save name' : 'Keep name'}
+              >
+                <Text style={[s.btnText, { color: nameChanged ? C.canvas : C.muted }]}>
+                  {nameChanged ? 'SAVE NAME' : 'KEEP NAME'}
+                </Text>
               </Pressable>
             </View>
           </Pressable>
@@ -842,9 +941,15 @@ export default function App() {
         animationType="slide"
         onRequestClose={() => setSelected(null)}
       >
-        <Pressable style={s.overlay} onPress={() => setSelected(null)}>
+        {/* Backdrop and sheet are siblings: no Pressable wraps the sheet, so the only touch handlers inside it
+            are the handle's PanResponder and the transcript ScrollView, and they never compete. */}
+        <View style={s.overlay}>
+          <Pressable
+            style={StyleSheet.absoluteFill}
+            onPress={() => setSelected(null)}
+            accessibilityLabel="Close transcript"
+          />
           {selected && (
-            <Pressable onPress={noop}>
              <Animated.View style={[s.sheet, { height: sheetH, maxHeight: winH }]}>
               {/* Drag the handle to resize the sheet (it follows the finger); a tap also toggles */}
               <View
@@ -885,7 +990,7 @@ export default function App() {
               {/* flex: 1 fills exactly the space left under the header, whatever the sheet height is */}
               <ScrollView
                 style={{ flex: 1, paddingHorizontal: 20 }}
-                contentContainerStyle={{ paddingTop: 20, paddingBottom: 56, gap: 16 }}
+                contentContainerStyle={{ paddingTop: 20, paddingBottom: 56 + bottomInset, gap: 16 }}
                 nestedScrollEnabled
                 showsVerticalScrollIndicator
               >
@@ -905,27 +1010,25 @@ export default function App() {
                 )}
               </ScrollView>
              </Animated.View>
-            </Pressable>
           )}
-        </Pressable>
+        </View>
       </Modal>
     </SafeAreaView>
   );
 }
 
+export default function App() {
+  return SafeArea ? (
+    <SafeArea.SafeAreaProvider>
+      <AppContent />
+    </SafeArea.SafeAreaProvider>
+  ) : (
+    <AppContent />
+  );
+}
+
 const s = StyleSheet.create({
   container: { flex: 1, backgroundColor: C.canvas },
-  header: {
-    flexDirection: 'row',
-    alignItems: 'center',
-    justifyContent: 'space-between',
-    paddingHorizontal: 20,
-    paddingTop: 16,
-    paddingBottom: 8,
-    borderBottomWidth: 1,
-    borderBottomColor: C.borderSubtle,
-  },
-  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
   mono10: { fontFamily: MONO, fontSize: 10, color: C.muted },
   mono9: { fontFamily: MONO, fontSize: 9, color: C.muted },
 
@@ -963,6 +1066,19 @@ const s = StyleSheet.create({
   },
   hours: { fontFamily: MONO, fontSize: 14, fontWeight: '500', color: C.text },
 
+  recentHead: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between', marginBottom: 12 },
+  searchBox: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 10,
+    marginBottom: 12,
+    paddingHorizontal: 14,
+    borderRadius: 12,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  searchInput: { flex: 1, paddingVertical: 10, fontFamily: MONO, fontSize: 13, color: C.text },
   empty: { fontSize: 13, lineHeight: 20, color: C.muted },
   card: {
     paddingHorizontal: 16,
