@@ -27,13 +27,15 @@ import { AudioPcmStreamAdapter } from 'whisper.rn/src/realtime-transcription/ada
 
 const MODEL_PATH = `${RNFS.ExternalDirectoryPath}/ggml-tiny.en.bin`;
 const AUDIO_PATH = `${RNFS.ExternalDirectoryPath}/jfk.wav`;
-const REC_PATH = `${RNFS.ExternalDirectoryPath}/recording.wav`;
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SEC = SAMPLE_RATE * 2; // 16-bit mono
 const MAX_SECONDS = 600; // batch recordings stop automatically at 10 minutes
 
 // Saved data lives in the app's private folder, so transcripts survive closing the app.
 const ENTRIES_PATH = `${RNFS.DocumentDirectoryPath}/entries.json`;
+// Every saved recording gets its own file here (internal app storage, private to this app).
+// Entries refer to files by name only, so the folder can move without breaking saved transcripts.
+const AUDIO_DIR = `${RNFS.DocumentDirectoryPath}/audio`;
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
 
 // Speech model: downloaded once from Hugging Face, then everything runs offline.
@@ -146,7 +148,24 @@ type Entry = {
   words: number;
   text: string;
   segs?: { t: number; text: string }[];
+  // --- audio association (all optional, so transcripts saved by older versions still load) ---
+  audioFile?: string; // file name inside AUDIO_DIR; missing = no audio kept for this entry
+  source?: 'mic' | 'live' | 'sample';
+  status?: 'done' | 'failed' | 'untranscribed'; // missing = done
 };
+
+const countWords = (t: string) => (t ? t.split(/\s+/).length : 0);
+const mapSegs = (segments?: any[]) =>
+  segments?.length
+    ? segments.map((g: any) => ({ t: (g.t0 ?? 0) / 100, text: String(g.text ?? '').trim() }))
+    : undefined;
+
+function friendlyFsError(e: any): string {
+  const m = String(e?.message ?? e);
+  return /ENOSPC|No space left/i.test(m)
+    ? 'Not enough free storage to save this recording. Free up some space and try again.'
+    : m;
+}
 
 // ---------- small UI pieces ----------
 function Waveform({ active, levelRef }: { active: boolean; levelRef: React.MutableRefObject<number> }) {
@@ -236,6 +255,13 @@ function AppContent() {
   const liveTextRef = useRef('');
   const elapsedRef = useRef(0);
   const levelRef = useRef(0);
+
+  // Latest values for code that runs from long-lived callbacks (e.g. the 10-minute auto-stop), which would
+  // otherwise see the values from the render when recording started.
+  const deleteAudioRef = useRef(false);
+  deleteAudioRef.current = deleteAudio;
+  const entriesRef = useRef<Entry[]>([]);
+  entriesRef.current = entries;
 
   const downloadJobRef = useRef<number | null>(null);
   const cancelledRef = useRef(false);
@@ -367,14 +393,34 @@ function AppContent() {
   };
   const openEntry = (e: Entry) => {
     Keyboard.dismiss();
+    if (e.status === 'failed' || e.status === 'untranscribed') {
+      Alert.alert(
+        'Not transcribed yet',
+        'This audio is saved on your device but has no transcript. Transcribe it now?',
+        [
+          { text: 'Not now', style: 'cancel' },
+          { text: 'Transcribe', onPress: () => retryTranscription(e) },
+        ],
+      );
+      return;
+    }
     setSelected(e);
   };
 
-  const nextName = () => `untitled-${String(entries.length + 1).padStart(4, '0')}`;
+  // next free "untitled-0001" style name; never reuses a number even if entries are renamed or removed later
+  const nextName = () => {
+    const list = entriesRef.current;
+    const maxUsed = list.reduce((m, e) => {
+      const x = /^untitled-(\d+)$/.exec(e.title);
+      return x ? Math.max(m, Number(x[1])) : m;
+    }, 0);
+    return `untitled-${String(Math.max(maxUsed, list.length) + 1).padStart(4, '0')}`;
+  };
 
-  const addEntry = (raw: string, secs: number, title?: string, segments?: any[]) => {
+  const addEntry = (raw: string, secs: number, title?: string, segments?: any[], extra: Partial<Entry> = {}) => {
     const t = raw.trim();
-    if (!t) {
+    // nothing to show: no speech and no audio kept
+    if (!t && !extra.audioFile) {
       setStatus('Done: no speech detected');
       return;
     }
@@ -383,15 +429,54 @@ function AppContent() {
       title: title ?? nextName(),
       date: new Date().toISOString().slice(0, 10),
       duration: fmt(secs),
-      words: t.split(/\s+/).length,
+      words: countWords(t),
       text: t,
-      segs: segments?.length
-        ? segments.map((g: any) => ({ t: (g.t0 ?? 0) / 100, text: String(g.text ?? '').trim() }))
-        : undefined,
+      segs: mapSegs(segments),
+      ...extra,
     };
     setEntries(cur => [entry, ...cur]);
-    setDraftName(entry.title);
-    setRenaming(entry);
+    // only offer the rename dialog when there is a real transcript to name
+    if (t) {
+      setDraftName(entry.title);
+      setRenaming(entry);
+    }
+  };
+
+  // Transcribe audio that was already saved (a failed attempt, or a file recovered after the app was closed
+  // mid-transcription). The retention setting applies once this succeeds, exactly as for a new recording.
+  const retryTranscription = async (e: Entry) => {
+    if (!e.audioFile || loading || recording) return;
+    setLoading(true);
+    try {
+      const path = `${AUDIO_DIR}/${e.audioFile}`;
+      if (!(await RNFS.exists(path))) throw new Error('The saved audio file could not be found.');
+      const ctx = await getContext();
+      setStatus('Transcribing...');
+      const start = Date.now();
+      const { promise } = ctx.transcribe(path, { language: 'en' });
+      const out: any = await promise;
+      const t = String(out.result ?? '').trim();
+      const keep = !deleteAudioRef.current;
+      if (!keep) await RNFS.unlink(path).catch(() => {});
+      const updated: Entry = {
+        ...e,
+        text: t,
+        words: countWords(t),
+        segs: mapSegs(out.segments),
+        status: 'done',
+        audioFile: keep ? e.audioFile : undefined,
+      };
+      setEntries(cur => cur.map(x => (x.id === e.id ? updated : x)));
+      setStatus(`Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
+      if (t) {
+        setDraftName(updated.title);
+        setRenaming(updated);
+      }
+    } catch (err: any) {
+      setStatus(`Error: ${err?.message ?? String(err)} Your audio is still saved.`);
+    } finally {
+      setLoading(false);
+    }
   };
 
   const getContext = async () => {
@@ -501,10 +586,31 @@ function AppContent() {
   useEffect(() => {
     (async () => {
       try {
+        let list: Entry[] = [];
         if (await RNFS.exists(ENTRIES_PATH)) {
           const data = JSON.parse(await RNFS.readFile(ENTRIES_PATH, 'utf8'));
-          if (Array.isArray(data)) setEntries(data);
+          if (Array.isArray(data)) list = data;
         }
+        // Audio files that no transcript points to (the app was closed mid-transcription) are never deleted:
+        // they come back as "not transcribed" entries so the user can transcribe or remove them.
+        try {
+          await RNFS.mkdir(AUDIO_DIR);
+          const known = new Set(list.map(e => e.audioFile).filter(Boolean));
+          const found = (await RNFS.readDir(AUDIO_DIR)).filter(f => f.isFile() && /\.wav$/i.test(f.name) && !known.has(f.name));
+          const recovered: Entry[] = found.map((f, i) => ({
+            id: `${f.name.replace(/\.wav$/i, '')}-${i}`,
+            title: `recovered-${f.name.replace(/^rec-/, '').replace(/\.wav$/i, '')}`,
+            date: (f.mtime ?? new Date()).toISOString().slice(0, 10),
+            duration: fmt(Math.max(0, (Number(f.size) - 44) / BYTES_PER_SEC)),
+            words: 0,
+            text: '',
+            audioFile: f.name,
+            source: 'mic',
+            status: 'untranscribed',
+          }));
+          list = [...recovered, ...list];
+        } catch {}
+        setEntries(list);
       } catch {}
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
@@ -571,7 +677,7 @@ function AppContent() {
       const start = Date.now();
       const { promise } = ctx.transcribe(AUDIO_PATH, { language: 'en' });
       const out: any = await promise;
-      addEntry(out.result, 11, 'jfk-test', out.segments);
+      addEntry(out.result, 11, 'jfk-test', out.segments, { source: 'sample' });
       setStatus(`Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);
@@ -621,7 +727,7 @@ function AppContent() {
     transcriberRef.current = null;
     setRecording(false);
     setStatus('Stopped');
-    addEntry(liveTextRef.current, elapsedRef.current);
+    addEntry(liveTextRef.current, elapsedRef.current, undefined, undefined, { source: 'live' });
     liveTextRef.current = '';
     setText('');
   };
@@ -632,6 +738,11 @@ function AppContent() {
     stoppingRef.current = true;
     setRecording(false);
     setLoading(true);
+    // Retention policy: the setting is read once, when recording stops. Changing it later never affects this file.
+    const discardAfter = deleteAudioRef.current;
+    const id = String(Date.now());
+    let audioFile: string | undefined; // set only once the audio is safely on disk
+    let seconds = 0;
     try {
       const adapter = adapterRef.current;
       adapterRef.current = null;
@@ -641,7 +752,7 @@ function AppContent() {
       } catch {}
 
       const total = bytesRef.current;
-      const seconds = total / BYTES_PER_SEC;
+      seconds = total / BYTES_PER_SEC;
       if (total < BYTES_PER_SEC / 2) {
         throw new Error('Recording too short (no audio captured)');
       }
@@ -655,20 +766,43 @@ function AppContent() {
         off += c.length;
       }
       chunksRef.current = [];
-      await RNFS.writeFile(REC_PATH, toBase64(all), 'base64');
+      const name = `rec-${id}.wav`;
+      const path = `${AUDIO_DIR}/${name}`;
+      try {
+        await RNFS.mkdir(AUDIO_DIR);
+        await RNFS.writeFile(path, toBase64(all), 'base64');
+      } catch (err: any) {
+        RNFS.unlink(path).catch(() => {}); // don't leave a half-written file behind
+        throw new Error(friendlyFsError(err));
+      }
+      audioFile = name;
 
       const ctx = await getContext();
       setStatus(`Transcribing ${seconds.toFixed(0)}s of audio...`);
       const start = Date.now();
-      const { promise } = ctx.transcribe(REC_PATH, { language: 'en' });
+      const { promise } = ctx.transcribe(path, { language: 'en' });
       const out: any = await promise;
-      addEntry(out.result, seconds, undefined, out.segments);
-      if (deleteAudio) RNFS.unlink(REC_PATH).catch(() => {});
+
+      // Transcription succeeded, so the policy can now be applied. (Before this point nothing is ever deleted.)
+      if (discardAfter) await RNFS.unlink(path).catch(() => {});
+      addEntry(out.result ?? '', seconds, undefined, out.segments, {
+        id,
+        source: 'mic',
+        audioFile: discardAfter ? undefined : audioFile,
+        status: 'done',
+      });
       setStatus(
         `Done: ${seconds.toFixed(0)}s of audio transcribed in ${((Date.now() - start) / 1000).toFixed(1)}s`,
       );
     } catch (e: any) {
-      setStatus(`Error: ${e?.message ?? String(e)}`);
+      const msg = e?.message ?? String(e);
+      if (audioFile) {
+        // The audio is saved but transcription failed: keep the file and show it in Recent so it can be retried.
+        addEntry('', seconds, undefined, undefined, { id, source: 'mic', audioFile, status: 'failed' });
+        setStatus(`Error: ${msg} Your audio was saved; tap it in Recent to try again.`);
+      } else {
+        setStatus(`Error: ${msg}`);
+      }
     } finally {
       setLoading(false);
     }
@@ -881,7 +1015,11 @@ function AppContent() {
                   {e.title}
                 </Text>
                 <Text style={[s.mono9, { marginTop: 6 }]}>
-                  {e.duration} · {e.words.toLocaleString()} WORDS
+                  {e.status === 'failed' || e.status === 'untranscribed'
+                    ? `${e.duration} · NOT TRANSCRIBED · AUDIO SAVED`
+                    : e.words === 0
+                    ? `${e.duration} · NO SPEECH DETECTED${e.audioFile ? ' · AUDIO SAVED' : ''}`
+                    : `${e.duration} · ${e.words.toLocaleString()} WORDS${e.audioFile ? ' · AUDIO SAVED' : ''}`}
                 </Text>
                 {!!q && !e.title.toLowerCase().includes(q) && (
                   <Text style={[s.mono9, { marginTop: 6, color: C.text }]} numberOfLines={2}>
@@ -1080,6 +1218,10 @@ function AppContent() {
                       }
                     />
                   </View>
+                  <Text style={[s.help, { marginLeft: 4, marginTop: 8 }]}>
+                    Applies to new recordings, after they are transcribed. Audio you have already saved is never
+                    deleted by changing this, and audio from a failed transcription is always kept.
+                  </Text>
                   <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>SPEECH MODEL</Text>
                   <View style={s.group}>
                     <MenuRow
@@ -1187,7 +1329,7 @@ function AppContent() {
                   ))
                 ) : (
                   <Text style={s.transcript} selectable>
-                    {selected.text}
+                    {selected.text || 'No speech was detected in this audio.'}
                   </Text>
                 )}
               </ScrollView>
