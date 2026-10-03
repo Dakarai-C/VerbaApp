@@ -21,6 +21,7 @@ import {
   View,
 } from 'react-native';
 import RNFS from 'react-native-fs';
+import { errorCodes, isErrorWithCode, keepLocalCopy, pick, types as pickerTypes } from '@react-native-documents/picker';
 import { initWhisper } from 'whisper.rn';
 import { RealtimeTranscriber } from 'whisper.rn/src/realtime-transcription';
 import { AudioPcmStreamAdapter } from 'whisper.rn/src/realtime-transcription/adapters/AudioPcmStreamAdapter';
@@ -37,6 +38,17 @@ const ENTRIES_PATH = `${RNFS.DocumentDirectoryPath}/entries.json`;
 // Entries refer to files by name only, so the folder can move without breaking saved transcripts.
 const AUDIO_DIR = `${RNFS.DocumentDirectoryPath}/audio`;
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
+
+// ---- Audio import ----
+// whisper.rn reliably reads WAV files. Compressed formats (MP3, M4A, AAC...) need a separate decoding step that
+// this app does not have yet, so only these extensions are accepted. Add 'mp3' here to experiment.
+const IMPORT_EXTENSIONS = ['wav'];
+// Whisper expects 16 kHz mono 16-bit audio. While true, WAV files in any other layout are refused with a clear message.
+// Set to false to let Whisper try them anyway (useful to find out whether the native decoder resamples).
+const STRICT_WAV_FORMAT = true;
+// Whisper loads the whole file into memory, which is risky on phones with little RAM. Conservative limit; tune on device.
+const MAX_IMPORT_BYTES = 200 * 1000 * 1000;
+const IMPORT_FREE_SPACE_MARGIN = 50 * 1000 * 1000; // keep this much free after copying
 
 // Speech model: downloaded once from Hugging Face, then everything runs offline.
 const MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin';
@@ -150,7 +162,7 @@ type Entry = {
   segs?: { t: number; text: string }[];
   // --- audio association (all optional, so transcripts saved by older versions still load) ---
   audioFile?: string; // file name inside AUDIO_DIR; missing = no audio kept for this entry
-  source?: 'mic' | 'live' | 'sample';
+  source?: 'mic' | 'live' | 'sample' | 'import';
   status?: 'done' | 'failed' | 'untranscribed'; // missing = done
 };
 
@@ -159,6 +171,60 @@ const mapSegs = (segments?: any[]) =>
   segments?.length
     ? segments.map((g: any) => ({ t: (g.t0 ?? 0) / 100, text: String(g.text ?? '').trim() }))
     : undefined;
+
+function fromBase64(b64: string): Uint8Array {
+  const clean = b64.replace(/[^A-Za-z0-9+/]/g, '');
+  const len = clean.length;
+  const out = new Uint8Array(Math.floor((len * 3) / 4));
+  const ix = (i: number) => (i < len ? B64.indexOf(clean[i]) : 0);
+  let o = 0;
+  for (let i = 0; i < len; i += 4) {
+    const n = (ix(i) << 18) | (ix(i + 1) << 12) | (ix(i + 2) << 6) | ix(i + 3);
+    out[o++] = (n >> 16) & 255;
+    if (i + 2 < len) out[o++] = (n >> 8) & 255;
+    if (i + 3 < len) out[o++] = n & 255;
+  }
+  return out;
+}
+
+type WavInfo = { format: number; channels: number; rate: number; bits: number; seconds: number };
+
+// Reads the RIFF/WAVE header. Returns null if this is not a readable WAV file.
+function parseWav(b: Uint8Array, fileSize: number): WavInfo | null {
+  const tag = (o: number) => String.fromCharCode(b[o], b[o + 1], b[o + 2], b[o + 3]);
+  if (b.length < 12 || tag(0) !== 'RIFF' || tag(8) !== 'WAVE') return null;
+  const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+  let fmtChunk: { format: number; channels: number; rate: number; byteRate: number; bits: number } | null = null;
+  let o = 12;
+  while (o + 8 <= b.length) {
+    const id = tag(o);
+    const size = dv.getUint32(o + 4, true);
+    if (id === 'fmt ' && o + 24 <= b.length) {
+      fmtChunk = {
+        format: dv.getUint16(o + 8, true),
+        channels: dv.getUint16(o + 10, true),
+        rate: dv.getUint32(o + 12, true),
+        byteRate: dv.getUint32(o + 16, true),
+        bits: dv.getUint16(o + 22, true),
+      };
+    } else if (id === 'data') {
+      if (!fmtChunk) return null;
+      const avail = Math.max(0, fileSize - (o + 8));
+      // streamed or truncated files can report 0 / 0xFFFFFFFF / too much: trust the real file size then
+      const dataBytes = !size || size === 0xffffffff || size > avail ? avail : size;
+      const byteRate = fmtChunk.byteRate || (fmtChunk.rate * fmtChunk.channels * fmtChunk.bits) / 8;
+      return {
+        format: fmtChunk.format,
+        channels: fmtChunk.channels,
+        rate: fmtChunk.rate,
+        bits: fmtChunk.bits,
+        seconds: byteRate > 0 ? dataBytes / byteRate : 0,
+      };
+    }
+    o += 8 + size + (size & 1);
+  }
+  return null;
+}
 
 function friendlyFsError(e: any): string {
   const m = String(e?.message ?? e);
@@ -599,13 +665,13 @@ function AppContent() {
           const found = (await RNFS.readDir(AUDIO_DIR)).filter(f => f.isFile() && /\.wav$/i.test(f.name) && !known.has(f.name));
           const recovered: Entry[] = found.map((f, i) => ({
             id: `${f.name.replace(/\.wav$/i, '')}-${i}`,
-            title: `recovered-${f.name.replace(/^rec-/, '').replace(/\.wav$/i, '')}`,
+            title: `recovered-${f.name.replace(/^(rec|imp)-/, '').replace(/\.wav$/i, '')}`,
             date: (f.mtime ?? new Date()).toISOString().slice(0, 10),
             duration: fmt(Math.max(0, (Number(f.size) - 44) / BYTES_PER_SEC)),
             words: 0,
             text: '',
             audioFile: f.name,
-            source: 'mic',
+            source: f.name.startsWith('imp-') ? 'import' : 'mic',
             status: 'untranscribed',
           }));
           list = [...recovered, ...list];
@@ -860,6 +926,150 @@ function AppContent() {
     }
   };
 
+  // ---------- import audio ----------
+
+  // Transcribes a file that is already inside AUDIO_DIR and applies the retention policy afterwards.
+  // Same rules as a microphone recording: nothing is deleted before transcription succeeds, and a failure keeps the
+  // audio and lists it in Recent as "not transcribed" so it can be retried.
+  const transcribeAndStore = async (
+    id: string,
+    audioFile: string,
+    seconds: number,
+    source: Entry['source'],
+    title: string | undefined,
+    discardAfter: boolean,
+  ) => {
+    const path = `${AUDIO_DIR}/${audioFile}`;
+    try {
+      const ctx = await getContext();
+      setStatus(`Transcribing ${seconds.toFixed(0)}s of audio...`);
+      const start = Date.now();
+      const { promise } = ctx.transcribe(path, { language: 'en' });
+      const out: any = await promise;
+      if (discardAfter) await RNFS.unlink(path).catch(() => {});
+      addEntry(out.result ?? '', seconds, title, out.segments, {
+        id,
+        source,
+        audioFile: discardAfter ? undefined : audioFile,
+        status: 'done',
+      });
+      setStatus(`Done: ${seconds.toFixed(0)}s of audio transcribed in ${((Date.now() - start) / 1000).toFixed(1)}s`);
+    } catch (e: any) {
+      addEntry('', seconds, title, undefined, { id, source, audioFile, status: 'failed' });
+      setStatus(`Error: ${e?.message ?? String(e)} Your audio was saved; tap it in Recent to try again.`);
+    }
+  };
+
+  const importAudio = async () => {
+    if (recording || loading) {
+      setStatus('Finish the current recording or transcription first');
+      return;
+    }
+
+    // 1. Android's system file picker. Cancelling is not an error.
+    let picked: Awaited<ReturnType<typeof pick>>[number];
+    try {
+      [picked] = await pick({ type: [pickerTypes.audio], allowMultiSelection: false });
+    } catch (e: any) {
+      if (isErrorWithCode(e) && (e.code === errorCodes.OPERATION_CANCELED || e.code === errorCodes.IN_PROGRESS)) return;
+      console.warn('Import: file picker failed', e);
+      setStatus('Error: Could not open the file picker. Please try again.');
+      return;
+    }
+
+    const originalName = picked.name ?? 'audio';
+    const ext = (originalName.split('.').pop() ?? '').toLowerCase();
+    const mime = (picked.type ?? '').toLowerCase();
+    const looksSupported = IMPORT_EXTENSIONS.includes(ext) || (IMPORT_EXTENSIONS.includes('wav') && /wav/.test(mime));
+    if (!looksSupported) {
+      setStatus(
+        `Error: "${originalName}" is not a supported format. Viva Voce can import ${IMPORT_EXTENSIONS.map(x => x.toUpperCase()).join(', ')} files for now. Convert other audio to WAV first.`,
+      );
+      return;
+    }
+    if (picked.size && picked.size > MAX_IMPORT_BYTES) {
+      setStatus(`Error: This file is too large (${(picked.size / 1e6).toFixed(0)} MB). Imports are limited to ${(MAX_IMPORT_BYTES / 1e6).toFixed(0)} MB for now.`);
+      return;
+    }
+
+    setLoading(true);
+    const discardAfter = deleteAudioRef.current; // retention policy, read once at the start
+    const id = String(Date.now());
+    let tempDir: string | null = null;
+    let finalPath: string | null = null;
+    let stored = false;
+    try {
+      // 2. enough free space for the copy?
+      if (picked.size) {
+        try {
+          const info = await RNFS.getFSInfo();
+          if (info.freeSpace < picked.size + IMPORT_FREE_SPACE_MARGIN) {
+            throw new Error(
+              `Not enough free storage to import this file (about ${(picked.size / 1e6).toFixed(0)} MB needed). Free up some space and try again.`,
+            );
+          }
+        } catch (e: any) {
+          if (String(e?.message).startsWith('Not enough')) throw e;
+        }
+      }
+
+      // 3. copy into the app's private storage (the picker copies natively, so big files don't pass through JS)
+      setStatus('Importing audio...');
+      const [copy] = await keepLocalCopy({
+        files: [{ uri: picked.uri, fileName: originalName }],
+        destination: 'documentDirectory',
+      });
+      if (copy.status !== 'success') {
+        console.warn('Import: copy failed', copy.copyError);
+        const reason = friendlyFsError(copy.copyError);
+        throw new Error(reason !== String(copy.copyError) ? reason : 'Could not read that file. It may have been moved or deleted.');
+      }
+      const tempPath = decodeURIComponent(copy.localUri.replace(/^file:\/\//, ''));
+      const dir = tempPath.substring(0, tempPath.lastIndexOf('/'));
+      if (dir.startsWith(`${RNFS.DocumentDirectoryPath}/`)) tempDir = dir; // the picker's own temporary folder
+
+      // 4. check it really is a usable WAV file
+      setStatus('Checking audio...');
+      const size = Number((await RNFS.stat(tempPath)).size);
+      if (size > MAX_IMPORT_BYTES) throw new Error(`This file is too large (${(size / 1e6).toFixed(0)} MB).`);
+      let info: WavInfo | null = null;
+      try {
+        info = parseWav(fromBase64(await RNFS.read(tempPath, 32768, 0, 'base64')), size);
+      } catch {}
+      if (!info) throw new Error(`"${originalName}" is not a readable WAV file.`);
+      if (info.format !== 1 || info.bits !== 16) {
+        throw new Error('Only standard 16-bit WAV files can be imported for now.');
+      }
+      if (STRICT_WAV_FORMAT && (info.rate !== 16000 || info.channels !== 1)) {
+        throw new Error(
+          `This WAV is ${(info.rate / 1000).toString()} kHz ${info.channels === 1 ? 'mono' : info.channels === 2 ? 'stereo' : `${info.channels}-channel`}. For now Viva Voce needs 16 kHz mono WAV, like its own recordings.`,
+        );
+      }
+      if (info.seconds < 0.5) throw new Error('This audio file is too short to transcribe.');
+
+      // 5. move into the audio folder under a unique name
+      const audioFile = `imp-${id}.wav`;
+      finalPath = `${AUDIO_DIR}/${audioFile}`;
+      await RNFS.mkdir(AUDIO_DIR);
+      await RNFS.moveFile(tempPath, finalPath);
+      stored = true;
+      if (tempDir) await RNFS.unlink(tempDir).catch(() => {});
+      tempDir = null;
+
+      // 6. same pipeline as a recording
+      const title = originalName.replace(/\.[^.]+$/, '').trim().slice(0, 60) || undefined;
+      await transcribeAndStore(id, audioFile, info.seconds, 'import', title, discardAfter);
+    } catch (e: any) {
+      if (!stored && finalPath) RNFS.unlink(finalPath).catch(() => {});
+      console.warn('Import failed', e);
+      setStatus(`Error: ${friendlyFsError(e)}`);
+    } finally {
+      // nothing the user imported is left half-copied in the app folder
+      if (tempDir) RNFS.unlink(tempDir).catch(() => {});
+      setLoading(false);
+    }
+  };
+
   // ---------- record button ----------
   const toggleRecording = async () => {
     if (recording) {
@@ -1069,6 +1279,15 @@ function AppContent() {
             </View>
             <View style={{ padding: 8 }}>
               <MenuRow
+                icon="⇪"
+                title="Import audio"
+                sub="WAV FILE FROM YOUR PHONE"
+                onPress={() => {
+                  setMenuOpen(false);
+                  importAudio();
+                }}
+              />
+              <MenuRow
                 icon="↓"
                 title="Transcribe test file"
                 sub="JFK SAMPLE ON DEVICE"
@@ -1190,6 +1409,7 @@ function AppContent() {
                       ['Whisper model weights (OpenAI)', 'MIT'],
                       ['React Native', 'MIT'],
                       ['react-native-fs', 'MIT'],
+                      ['@react-native-documents/picker', 'MIT'],
                       ['@fugood/react-native-audio-pcm-stream', 'MIT'],
                     ].map(([name, lic], i) => (
                       <View key={name} style={[s.licRow, i > 0 && { borderTopWidth: 1, borderTopColor: C.borderSubtle }]}>
