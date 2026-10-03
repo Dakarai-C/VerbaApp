@@ -40,6 +40,9 @@ const ENTRIES_PATH = `${RNFS.DocumentDirectoryPath}/entries.json`;
 // Entries refer to files by name only, so the folder can move without breaking saved transcripts.
 const AUDIO_DIR = `${RNFS.DocumentDirectoryPath}/audio`;
 const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
+// Audio files whose transcript the user deleted while choosing to KEEP the audio. Without this list, the startup
+// recovery below would find those files again and list them as "not transcribed" recordings.
+const DETACHED_PATH = `${RNFS.DocumentDirectoryPath}/detached-audio.json`;
 
 // ---- Audio import ----
 // whisper.rn reliably reads WAV files. Compressed formats (MP3, M4A, AAC...) need a separate decoding step that
@@ -235,6 +238,10 @@ function friendlyFsError(e: any): string {
     : m;
 }
 
+// An entry's audioFile must be a bare file name. Anything with a path in it is never touched.
+const isPlainFileName = (n: unknown): n is string =>
+  typeof n === 'string' && n.length > 0 && !/[\\/]/.test(n) && n !== '.' && n !== '..';
+
 // ---------- small UI pieces ----------
 function Waveform({ active, levelRef }: { active: boolean; levelRef: React.MutableRefObject<number> }) {
   const N = 40;
@@ -424,6 +431,12 @@ function AppContent() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [renaming, setRenaming] = useState<Entry | null>(null);
   const [draftName, setDraftName] = useState('');
+  const [deleting, setDeleting] = useState<Entry | null>(null); // entry the delete dialog is open for
+  const [deleteBusy, setDeleteBusy] = useState(false);
+  const deleteBusyRef = useRef(false);
+  // Highest "untitled-NNNN" number ever handed out. Saved in settings.json so deleting entries never frees a number.
+  const [nameCounter, setNameCounter] = useState(0);
+  const nameCounterRef = useRef(0);
   const [sheetExpanded, setSheetExpanded] = useState(false); // transcript sheet: settled state (drag or tap the handle)
   const [searchOpen, setSearchOpen] = useState(false);
   const [query, setQuery] = useState('');
@@ -723,6 +736,7 @@ function AppContent() {
         'This audio is saved on your device but has no transcript. Transcribe it now?',
         [
           { text: 'Not now', style: 'cancel' },
+          { text: 'Delete', style: 'destructive', onPress: () => setDeleting(e) },
           { text: 'Transcribe', onPress: () => retryTranscription(e) },
         ],
       );
@@ -731,15 +745,16 @@ function AppContent() {
     setSelected(e);
   };
 
-  // next free "untitled-0001" style name; never reuses a number even if entries are renamed or removed later
-  const nextName = () => {
-    const list = entriesRef.current;
-    const maxUsed = list.reduce((m, e) => {
+  // next free "untitled-0001" style name; the number only ever goes up, even if entries are renamed or deleted
+  const nextNumber = () => {
+    const maxUsed = entriesRef.current.reduce((m, e) => {
       const x = /^untitled-(\d+)$/.exec(e.title);
       return x ? Math.max(m, Number(x[1])) : m;
     }, 0);
-    return `untitled-${String(Math.max(maxUsed, list.length) + 1).padStart(4, '0')}`;
+    return Math.max(maxUsed, nameCounterRef.current) + 1;
   };
+  const nameFor = (n: number) => `untitled-${String(n).padStart(4, '0')}`;
+  const nextName = () => nameFor(nextNumber());
 
   const addEntry = (raw: string, secs: number, title?: string, segments?: any[], extra: Partial<Entry> = {}) => {
     const t = raw.trim();
@@ -748,9 +763,16 @@ function AppContent() {
       setStatus('Done: no speech detected');
       return;
     }
+    let finalTitle = title;
+    if (finalTitle === undefined) {
+      const n = nextNumber();
+      nameCounterRef.current = n; // reserved for good, even if this entry is deleted later
+      setNameCounter(n);
+      finalTitle = nameFor(n);
+    }
     const entry: Entry = {
       id: String(Date.now()),
-      title: title ?? nextName(),
+      title: finalTitle,
       date: new Date().toISOString().slice(0, 10),
       duration: fmt(secs),
       words: countWords(t),
@@ -909,8 +931,16 @@ function AppContent() {
 
   useEffect(() => {
     (async () => {
+      let counterBase = 0;
       try {
         let list: Entry[] = [];
+        let detached: string[] = [];
+        try {
+          if (await RNFS.exists(DETACHED_PATH)) {
+            const d = JSON.parse(await RNFS.readFile(DETACHED_PATH, 'utf8'));
+            if (Array.isArray(d)) detached = d.filter((x: any) => typeof x === 'string');
+          }
+        } catch {}
         if (await RNFS.exists(ENTRIES_PATH)) {
           const data = JSON.parse(await RNFS.readFile(ENTRIES_PATH, 'utf8'));
           if (Array.isArray(data)) list = data;
@@ -919,7 +949,7 @@ function AppContent() {
         // they come back as "not transcribed" entries so the user can transcribe or remove them.
         try {
           await RNFS.mkdir(AUDIO_DIR);
-          const known = new Set(list.map(e => e.audioFile).filter(Boolean));
+          const known = new Set([...list.map(e => e.audioFile).filter(Boolean), ...detached]);
           const found = (await RNFS.readDir(AUDIO_DIR)).filter(f => f.isFile() && /\.wav$/i.test(f.name) && !known.has(f.name));
           const recovered: Entry[] = found.map((f, i) => ({
             id: `${f.name.replace(/\.wav$/i, '')}-${i}`,
@@ -935,15 +965,23 @@ function AppContent() {
           list = [...recovered, ...list];
         } catch {}
         setEntries(list);
+        // start the name counter above every number already used (covers installs from before the counter existed)
+        counterBase = list.reduce((m, e) => {
+          const x = /^untitled-(\d+)$/.exec(e.title);
+          return x ? Math.max(m, Number(x[1])) : m;
+        }, list.length);
       } catch {}
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
           const st = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
+          if (typeof st.nameCounter === 'number' && st.nameCounter > counterBase) counterBase = st.nameCounter;
           if (typeof st.deleteAudio === 'boolean') setDeleteAudio(st.deleteAudio);
           if (typeof st.showTimestamps === 'boolean') setShowTimestamps(st.showTimestamps);
           if (typeof st.batchMode === 'boolean') setBatchMode(st.batchMode);
         }
       } catch {}
+      nameCounterRef.current = counterBase;
+      setNameCounter(counterBase);
       setLoaded(true);
       if (!(await checkModel())) setStatus('Speech model not downloaded. Open Settings to get it.');
     })();
@@ -958,8 +996,8 @@ function AppContent() {
 
   useEffect(() => {
     if (!loaded) return;
-    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode }), 'utf8').catch(() => {});
-  }, [deleteAudio, showTimestamps, batchMode, loaded]);
+    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode, nameCounter }), 'utf8').catch(() => {});
+  }, [deleteAudio, showTimestamps, batchMode, nameCounter, loaded]);
 
   // re-check the model whenever Settings is opened
   useEffect(() => {
@@ -1355,6 +1393,83 @@ function AppContent() {
     setSelected(updated);
   };
 
+  // ---------- delete ----------
+  // Removes an audio file that an entry explicitly points to. A file that is already gone counts as deleted.
+  const removeAudioFile = async (file: string) => {
+    const path = `${AUDIO_DIR}/${file}`;
+    if (!(await RNFS.exists(path))) return;
+    try {
+      await RNFS.unlink(path);
+    } catch (err) {
+      if (await RNFS.exists(path).catch(() => true)) throw err; // still there: a real failure
+    }
+  };
+
+  // withAudio=false: remove the transcript, keep the audio file. withAudio=true: remove both.
+  // Order matters: playback stops first; then the saved lists are updated (if that fails nothing has been touched yet);
+  // only then is the audio file removed. Only the file named by this entry's own audioFile is ever deleted.
+  const deleteEntry = async (target: Entry, withAudio: boolean) => {
+    if (deleteBusyRef.current) return;
+    deleteBusyRef.current = true;
+    setDeleteBusy(true);
+    const file = isPlainFileName(target.audioFile) ? target.audioFile : undefined;
+    let audioProblem = false;
+    try {
+      if (playerRef.current.id === target.id) stopPlayback(); // also cancels a load that is still in progress
+
+      const remaining = entriesRef.current.filter(x => x.id !== target.id);
+      try {
+        if (file && !withAudio) {
+          // remember that this audio was kept on purpose, so startup recovery does not list it again
+          let detached: string[] = [];
+          try {
+            if (await RNFS.exists(DETACHED_PATH)) {
+              const d = JSON.parse(await RNFS.readFile(DETACHED_PATH, 'utf8'));
+              if (Array.isArray(d)) detached = d.filter((x: any) => typeof x === 'string');
+            }
+          } catch {}
+          if (!detached.includes(file)) {
+            await RNFS.writeFile(DETACHED_PATH, JSON.stringify([...detached, file]), 'utf8');
+          }
+        }
+        await RNFS.writeFile(ENTRIES_PATH, JSON.stringify(remaining), 'utf8');
+      } catch (err) {
+        console.warn('Delete: could not save the updated list', err);
+        setDeleting(null);
+        Alert.alert('Could not delete', 'Your transcript was not deleted. Please try again.');
+        return;
+      }
+
+      if (file && withAudio) {
+        try {
+          await removeAudioFile(file);
+        } catch (err) {
+          console.warn('Delete: could not remove audio file', file, err);
+          audioProblem = true;
+        }
+      }
+
+      setEntries(cur => cur.filter(x => x.id !== target.id));
+      setSelected(cur => (cur?.id === target.id ? null : cur));
+      setRenaming(cur => (cur?.id === target.id ? null : cur));
+      if (remaining.length === 0) {
+        setSearchOpen(false);
+        setQuery('');
+      }
+      setDeleting(null);
+      setStatus(`Deleted "${target.title}"`);
+      if (audioProblem) {
+        Alert.alert(
+          'Transcript deleted',
+          'The transcript was deleted, but its audio file could not be removed. It may show up in Recent as a recording that is not transcribed, where you can try deleting it again.',
+        );
+      }
+    } finally {
+      deleteBusyRef.current = false;
+      setDeleteBusy(false);
+    }
+  };
+
   const closeSettings = () => {
     setSettingsOpen(false);
     setLicensesOpen(false);
@@ -1650,6 +1765,62 @@ function AppContent() {
         </Pressable>
       </Modal>
 
+      {/* Delete dialog */}
+      <Modal
+        visible={!!deleting}
+        transparent
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => !deleteBusy && setDeleting(null)}
+      >
+        <Pressable
+          style={[s.overlay, { justifyContent: 'center', paddingHorizontal: 20 }]}
+          onPress={() => !deleteBusy && setDeleting(null)}
+        >
+          <Pressable style={s.dialog} onPress={noop}>
+            <View style={{ padding: 20 }}>
+              <Text style={[s.mono9, { color: C.red, letterSpacing: 2 }]}>DELETE</Text>
+              <Text style={[s.menuTitle, { fontSize: 18, marginTop: 4 }]}>Delete transcription?</Text>
+              <Text style={s.help}>What would you like to remove?</Text>
+              <Text style={[s.mono9, { color: C.text, marginTop: 12 }]} numberOfLines={1}>
+                {deleting?.title}
+              </Text>
+              <Text style={[s.help, { marginTop: 12 }]}>
+                {deleting?.audioFile
+                  ? 'Delete Transcript removes the text only; the audio stays on your device. Delete Transcript + Audio removes both, and cannot be undone.'
+                  : 'This entry has no saved audio, so either choice removes the transcript. This cannot be undone.'}
+              </Text>
+            </View>
+            <View style={s.btnCol}>
+              <Pressable
+                style={[s.btn, s.btnStack, s.btnDangerOutline, deleteBusy && { opacity: 0.5 }]}
+                disabled={deleteBusy}
+                onPress={() => deleting && deleteEntry(deleting, false)}
+                accessibilityLabel="Delete transcript only"
+              >
+                <Text style={[s.btnText, { color: C.red }]}>DELETE TRANSCRIPT</Text>
+              </Pressable>
+              <Pressable
+                style={[s.btn, s.btnStack, { backgroundColor: C.red }, deleteBusy && { opacity: 0.5 }]}
+                disabled={deleteBusy}
+                onPress={() => deleting && deleteEntry(deleting, true)}
+                accessibilityLabel="Delete transcript and audio"
+              >
+                <Text style={[s.btnText, { color: C.canvas }]}>DELETE TRANSCRIPT + AUDIO</Text>
+              </Pressable>
+              <Pressable
+                style={[s.btn, s.btnStack, { backgroundColor: C.faint }]}
+                disabled={deleteBusy}
+                onPress={() => setDeleting(null)}
+                accessibilityLabel="Cancel"
+              >
+                <Text style={[s.btnText, { color: C.muted }]}>CANCEL</Text>
+              </Pressable>
+            </View>
+          </Pressable>
+        </Pressable>
+      </Modal>
+
       {/* Settings sheet */}
       <Modal
         visible={settingsOpen}
@@ -1795,9 +1966,18 @@ function AppContent() {
                     {selected.date} · {selected.duration} · {selected.words.toLocaleString()} WORDS
                   </Text>
                 </View>
-                <Pressable onPress={() => exportEntry(selected)} style={s.exportBtn}>
-                  <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
-                </Pressable>
+                <View style={{ flexDirection: 'row', gap: 8 }}>
+                  <Pressable onPress={() => exportEntry(selected)} style={s.exportBtn}>
+                    <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
+                  </Pressable>
+                  <Pressable
+                    onPress={() => setDeleting(selected)}
+                    style={[s.exportBtn, { borderColor: `${C.red}66` }]}
+                    accessibilityLabel="Delete transcription"
+                  >
+                    <Text style={[s.mono9, { color: C.red }]}>⌫ DELETE</Text>
+                  </Pressable>
+                </View>
               </View>
               {!!selected.audioFile && (
                 <View style={s.sheetPlayer}>
@@ -2047,6 +2227,9 @@ const s = StyleSheet.create({
     borderColor: C.border,
   },
   btnRow: { flexDirection: 'row', gap: 8, padding: 12, borderTopWidth: 1, borderTopColor: C.border },
+  btnCol: { gap: 8, padding: 12, borderTopWidth: 1, borderTopColor: C.border },
+  btnStack: { flex: 0, alignSelf: 'stretch' }, // s.btn has flex: 1, which collapses to zero height in a column
+  btnDangerOutline: { borderWidth: 1, borderColor: C.red },
   btn: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center' },
   btnText: { fontSize: 12, fontWeight: '600' },
 
