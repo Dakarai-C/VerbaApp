@@ -11,6 +11,7 @@ import {
   StyleSheet,
   Switch,
   Text,
+  TextInput,
   View,
 } from 'react-native';
 import RNFS from 'react-native-fs';
@@ -113,6 +114,7 @@ type Entry = {
   duration: string;
   words: number;
   text: string;
+  segs?: { t: number; text: string }[];
 };
 
 // ---------- small UI pieces ----------
@@ -174,6 +176,12 @@ export default function App() {
   const [selected, setSelected] = useState<Entry | null>(null);
   const [menuOpen, setMenuOpen] = useState(false);
   const [freeHrs, setFreeHrs] = useState<number | null>(null);
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [licensesOpen, setLicensesOpen] = useState(false);
+  const [deleteAudio, setDeleteAudio] = useState(false);
+  const [showTimestamps, setShowTimestamps] = useState(true);
+  const [renaming, setRenaming] = useState<Entry | null>(null);
+  const [draftName, setDraftName] = useState('');
 
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
@@ -208,7 +216,7 @@ export default function App() {
 
   const nextName = () => `untitled-${String(entries.length + 1).padStart(4, '0')}`;
 
-  const addEntry = (raw: string, secs: number, title?: string) => {
+  const addEntry = (raw: string, secs: number, title?: string, segments?: any[]) => {
     const t = raw.trim();
     if (!t) {
       setStatus('Done: no speech detected');
@@ -221,9 +229,13 @@ export default function App() {
       duration: fmt(secs),
       words: t.split(/\s+/).length,
       text: t,
+      segs: segments?.length
+        ? segments.map((g: any) => ({ t: (g.t0 ?? 0) / 100, text: String(g.text ?? '').trim() }))
+        : undefined,
     };
     setEntries(cur => [entry, ...cur]);
-    setSelected(entry);
+    setDraftName(entry.title);
+    setRenaming(entry);
   };
 
   const getContext = async () => {
@@ -257,8 +269,8 @@ export default function App() {
       setStatus('Transcribing...');
       const start = Date.now();
       const { promise } = ctx.transcribe(AUDIO_PATH, { language: 'en' });
-      const { result } = await promise;
-      addEntry(result, 11, 'jfk-test');
+      const out: any = await promise;
+      addEntry(out.result, 11, 'jfk-test', out.segments);
       setStatus(`Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);
@@ -348,8 +360,9 @@ export default function App() {
       setStatus(`Transcribing ${seconds.toFixed(0)}s of audio...`);
       const start = Date.now();
       const { promise } = ctx.transcribe(REC_PATH, { language: 'en' });
-      const { result } = await promise;
-      addEntry(result, seconds);
+      const out: any = await promise;
+      addEntry(out.result, seconds, undefined, out.segments);
+      if (deleteAudio) RNFS.unlink(REC_PATH).catch(() => {});
       setStatus(
         `Done: ${seconds.toFixed(0)}s of audio transcribed in ${((Date.now() - start) / 1000).toFixed(1)}s`,
       );
@@ -428,6 +441,15 @@ export default function App() {
 
   const exportEntry = (e: Entry) =>
     Share.share({ message: `${e.title}\n${e.date} · ${e.duration}\n\n${e.text}` });
+
+  const confirmRename = (keep: boolean) => {
+    if (!renaming) return;
+    const name = keep ? renaming.title : draftName.trim() || renaming.title;
+    const updated = { ...renaming, title: name };
+    setEntries(cur => cur.map(e => (e.id === updated.id ? updated : e)));
+    setRenaming(null);
+    setSelected(updated);
+  };
 
   const isError = status.startsWith('Error');
 
@@ -545,7 +567,14 @@ export default function App() {
         <Pressable onPress={() => setMenuOpen(true)} accessibilityLabel="Add audio" style={s.fab}>
           <Text style={{ color: C.amber, fontSize: 28, lineHeight: 30 }}>+</Text>
         </Pressable>
-        <View style={s.navItem} />
+        <Pressable
+          style={s.navItem}
+          onPress={() => setSettingsOpen(true)}
+          accessibilityLabel="Settings"
+        >
+          <Text style={{ color: C.faint, fontSize: 16 }}>◈</Text>
+          <Text style={[s.mono9, { letterSpacing: 1 }]}>SETTINGS</Text>
+        </Pressable>
       </View>
 
       {/* Add audio menu */}
@@ -596,6 +625,130 @@ export default function App() {
         </View>
       </Modal>
 
+      {/* Rename dialog */}
+      <Modal visible={!!renaming} transparent animationType="fade" onRequestClose={() => confirmRename(true)}>
+        <View style={[s.modalEnd, { justifyContent: 'flex-start', paddingTop: 120, paddingHorizontal: 20 }]}>
+          <Pressable style={s.backdrop} onPress={() => confirmRename(true)} />
+          <View style={s.dialog}>
+            <View style={{ padding: 20 }}>
+              <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>TRANSCRIPT READY</Text>
+              <Text style={[s.menuTitle, { fontSize: 18, marginTop: 4 }]}>Rename this file?</Text>
+              <Text style={s.help}>Give your recording a useful name, or keep the generated one.</Text>
+              <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 20, marginBottom: 8 }]}>FILE NAME</Text>
+              <TextInput
+                value={draftName}
+                onChangeText={setDraftName}
+                autoFocus
+                selectTextOnFocus
+                autoCorrect={false}
+                autoCapitalize="none"
+                placeholderTextColor={C.muted}
+                style={s.input}
+                accessibilityLabel="Recording file name"
+              />
+            </View>
+            <View style={s.btnRow}>
+              <Pressable style={[s.btn, { borderWidth: 1, borderColor: C.border }]} onPress={() => confirmRename(true)}>
+                <Text style={[s.btnText, { color: C.muted }]}>KEEP NAME</Text>
+              </Pressable>
+              <Pressable style={[s.btn, { backgroundColor: C.amber }]} onPress={() => confirmRename(false)}>
+                <Text style={[s.btnText, { color: C.canvas }]}>SAVE NAME</Text>
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Settings sheet */}
+      <Modal
+        visible={settingsOpen}
+        transparent
+        animationType="slide"
+        onRequestClose={() => {
+          setSettingsOpen(false);
+          setLicensesOpen(false);
+        }}
+      >
+        <View style={s.modalEnd}>
+          <Pressable
+            style={s.backdrop}
+            onPress={() => {
+              setSettingsOpen(false);
+              setLicensesOpen(false);
+            }}
+          />
+          <View style={s.sheet}>
+            <View style={s.handle} />
+            <View style={[s.sheetHead, { alignItems: 'center' }]}>
+              {licensesOpen && (
+                <Pressable onPress={() => setLicensesOpen(false)} style={s.backBtn} accessibilityLabel="Back to settings">
+                  <Text style={{ color: C.muted, fontSize: 22, lineHeight: 24 }}>‹</Text>
+                </Pressable>
+              )}
+              <View>
+                <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>
+                  {licensesOpen ? 'OPEN SOURCE' : 'PREFERENCES'}
+                </Text>
+                <Text style={[s.menuTitle, { fontSize: 16, marginTop: 2 }]}>{licensesOpen ? 'Licenses' : 'Settings'}</Text>
+              </View>
+            </View>
+            <ScrollView style={{ flexShrink: 1 }} contentContainerStyle={{ padding: 16 }}>
+              {licensesOpen ? (
+                <>
+                  <Text style={[s.help, { marginBottom: 16 }]}>
+                    Transcribe runs on open-source software. Everything stays on this device.
+                  </Text>
+                  <View style={s.group}>
+                    {[
+                      ['whisper.cpp', 'MIT'],
+                      ['whisper.rn', 'MIT'],
+                      ['Whisper model weights (OpenAI)', 'MIT'],
+                      ['React Native', 'MIT'],
+                      ['react-native-fs', 'MIT'],
+                    ].map(([name, lic], i) => (
+                      <View key={name} style={[s.licRow, i > 0 && { borderTopWidth: 1, borderTopColor: C.borderSubtle }]}>
+                        <Text style={[s.menuTitle, { flex: 1, fontWeight: '500' }]}>{name}</Text>
+                        <Text style={s.badge}>{lic}</Text>
+                      </View>
+                    ))}
+                  </View>
+                </>
+              ) : (
+                <>
+                  <Text style={[s.mono9, { letterSpacing: 1.5, marginBottom: 8, marginLeft: 4 }]}>PRIVACY & STORAGE</Text>
+                  <View style={s.group}>
+                    <MenuRow
+                      icon="⌫"
+                      title="Delete audio after transcription"
+                      sub="KEEP TRANSCRIPT ONLY"
+                      onPress={() => setDeleteAudio(v => !v)}
+                      right={
+                        <Switch
+                          value={deleteAudio}
+                          onValueChange={setDeleteAudio}
+                          trackColor={{ false: C.faint, true: C.amber }}
+                          thumbColor={C.canvas}
+                        />
+                      }
+                    />
+                  </View>
+                  <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>ABOUT</Text>
+                  <View style={s.group}>
+                    <MenuRow
+                      icon="i"
+                      title="Licenses"
+                      sub="OPEN-SOURCE ATTRIBUTIONS"
+                      onPress={() => setLicensesOpen(true)}
+                      right={<Text style={{ color: C.muted, fontSize: 20 }}>›</Text>}
+                    />
+                  </View>
+                </>
+              )}
+            </ScrollView>
+          </View>
+        </View>
+      </Modal>
+
       {/* Transcript sheet */}
       <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
         <View style={s.modalEnd}>
@@ -617,10 +770,32 @@ export default function App() {
                   <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
                 </Pressable>
               </View>
-              <ScrollView style={{ paddingHorizontal: 20 }} contentContainerStyle={{ paddingVertical: 20 }}>
-                <Text style={s.transcript} selectable>
-                  {selected.text}
-                </Text>
+              {!!selected.segs && (
+                <View style={s.tsRow}>
+                  <Text style={[s.mono9, { letterSpacing: 1.5 }]}>TIMESTAMPS</Text>
+                  <Switch
+                    value={showTimestamps}
+                    onValueChange={setShowTimestamps}
+                    trackColor={{ false: C.faint, true: C.amber }}
+                    thumbColor={C.canvas}
+                  />
+                </View>
+              )}
+              <ScrollView style={{ flexShrink: 1, paddingHorizontal: 20 }} contentContainerStyle={{ paddingVertical: 20, gap: 16 }}>
+                {selected.segs ? (
+                  selected.segs.map((g, i) => (
+                    <View key={i} style={{ flexDirection: 'row', gap: 12 }}>
+                      {showTimestamps && <Text style={s.tsTime}>{fmt(g.t)}</Text>}
+                      <Text style={[s.transcript, { flex: 1 }]} selectable>
+                        {g.text}
+                      </Text>
+                    </View>
+                  ))
+                ) : (
+                  <Text style={s.transcript} selectable>
+                    {selected.text}
+                  </Text>
+                )}
               </ScrollView>
             </View>
           )}
@@ -766,4 +941,46 @@ const s = StyleSheet.create({
     borderColor: C.border,
   },
   transcript: { fontFamily: MONO, fontSize: 12, lineHeight: 24, color: C.text },
+  tsRow: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingVertical: 6,
+    backgroundColor: C.raised,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  tsTime: { width: 38, paddingTop: 7, fontFamily: MONO, fontSize: 9, color: C.amber },
+
+  dialog: { borderRadius: 16, overflow: 'hidden', backgroundColor: C.raised, borderWidth: 1, borderColor: C.faint },
+  help: { marginTop: 4, fontSize: 12, lineHeight: 20, color: C.muted },
+  input: {
+    paddingHorizontal: 14,
+    paddingVertical: 12,
+    borderRadius: 12,
+    fontFamily: MONO,
+    fontSize: 14,
+    color: C.text,
+    backgroundColor: C.canvas,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  btnRow: { flexDirection: 'row', gap: 8, padding: 12, borderTopWidth: 1, borderTopColor: C.border },
+  btn: { flex: 1, paddingVertical: 12, borderRadius: 12, alignItems: 'center' },
+  btnText: { fontSize: 12, fontWeight: '600' },
+
+  group: { borderRadius: 16, overflow: 'hidden', backgroundColor: C.raised, borderWidth: 1, borderColor: C.border },
+  backBtn: { width: 32, height: 32, alignItems: 'center', justifyContent: 'center' },
+  licRow: { flexDirection: 'row', alignItems: 'center', gap: 12, paddingHorizontal: 16, paddingVertical: 14 },
+  badge: {
+    paddingHorizontal: 8,
+    paddingVertical: 4,
+    borderRadius: 6,
+    overflow: 'hidden',
+    fontFamily: MONO,
+    fontSize: 9,
+    color: C.amber,
+    backgroundColor: C.amberMuted,
+  },
 });
