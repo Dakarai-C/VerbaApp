@@ -84,6 +84,15 @@ let SafeArea: any = null;
 try {
   SafeArea = require('react-native-safe-area-context');
 } catch {}
+// App lock uses the system biometric prompt (fingerprint / face, with the phone's PIN or pattern as fallback).
+// Loaded the same optional way: if the package is not installed, the lock switch explains that instead of crashing.
+let Biometrics: any = null;
+try {
+  Biometrics = require('@sbaiahmed1/react-native-biometrics');
+} catch {}
+// Error text that means "this phone has no screen lock / enrolled biometrics to check against" (as opposed to the user
+// cancelling or failing a scan). Heuristic on the library's message: tune here if the J8 reports it differently.
+const NO_SECURITY_RE = /not.?enrolled|none.?enrolled|no.?(device.?)?credential|no.?biometric|not.?available|no.?hardware|passcode.?not.?set/i;
 const useBottomInset: () => number = SafeArea ? () => SafeArea.useSafeAreaInsets().bottom : () => 0;
 
 // one-line context around the first match, for search results that matched on transcript text
@@ -434,6 +443,28 @@ function AppContent() {
   const [deleting, setDeleting] = useState<Entry | null>(null); // entry the delete dialog is open for
   const [deleteBusy, setDeleteBusy] = useState(false);
   const deleteBusyRef = useRef(false);
+  // ---- app lock ----
+  const [appLock, setAppLock] = useState(false); // the setting
+  const [locked, setLocked] = useState(true); // starts locked so nothing flashes before the setting is read
+  const [lockMsg, setLockMsg] = useState('');
+  const appLockRef = useRef(false);
+  appLockRef.current = appLock;
+  const lockedRef = useRef(true);
+  lockedRef.current = locked;
+  const authBusyRef = useRef(false);
+  // System screens we open ourselves (file picker, share sheet, permission prompt, the biometric prompt) send the app to
+  // the background for a moment. That must not count as "the user left the app".
+  const suppressLockRef = useRef(false);
+  const withoutLock = async <T,>(fn: () => Promise<T>): Promise<T> => {
+    suppressLockRef.current = true;
+    try {
+      return await fn();
+    } finally {
+      setTimeout(() => {
+        suppressLockRef.current = false;
+      }, 600);
+    }
+  };
   // Highest "untitled-NNNN" number ever handed out. Saved in settings.json so deleting entries never frees a number.
   const [nameCounter, setNameCounter] = useState(0);
   const nameCounterRef = useRef(0);
@@ -837,7 +868,7 @@ function AppContent() {
   };
 
   const ensureMic = async () => {
-    const perm = await PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO);
+    const perm = await withoutLock(() => PermissionsAndroid.request(PermissionsAndroid.PERMISSIONS.RECORD_AUDIO));
     if (perm !== PermissionsAndroid.RESULTS.GRANTED) {
       setStatus('Microphone permission denied');
       return false;
@@ -932,6 +963,7 @@ function AppContent() {
   useEffect(() => {
     (async () => {
       let counterBase = 0;
+      let lockOn = false;
       try {
         let list: Entry[] = [];
         let detached: string[] = [];
@@ -974,6 +1006,10 @@ function AppContent() {
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
           const st = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
+          if (typeof st.appLock === 'boolean') {
+            lockOn = st.appLock;
+            setAppLock(st.appLock);
+          }
           if (typeof st.nameCounter === 'number' && st.nameCounter > counterBase) counterBase = st.nameCounter;
           if (typeof st.deleteAudio === 'boolean') setDeleteAudio(st.deleteAudio);
           if (typeof st.showTimestamps === 'boolean') setShowTimestamps(st.showTimestamps);
@@ -982,6 +1018,7 @@ function AppContent() {
       } catch {}
       nameCounterRef.current = counterBase;
       setNameCounter(counterBase);
+      setLocked(lockOn && !!Biometrics);
       setLoaded(true);
       if (!(await checkModel())) setStatus('Speech model not downloaded. Open Settings to get it.');
     })();
@@ -996,8 +1033,8 @@ function AppContent() {
 
   useEffect(() => {
     if (!loaded) return;
-    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode, nameCounter }), 'utf8').catch(() => {});
-  }, [deleteAudio, showTimestamps, batchMode, nameCounter, loaded]);
+    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode, nameCounter, appLock }), 'utf8').catch(() => {});
+  }, [deleteAudio, showTimestamps, batchMode, nameCounter, appLock, loaded]);
 
   // re-check the model whenever Settings is opened
   useEffect(() => {
@@ -1265,7 +1302,7 @@ function AppContent() {
     // 1. Android's system file picker. Cancelling is not an error.
     let picked: Awaited<ReturnType<typeof pick>>[number];
     try {
-      [picked] = await pick({ type: [pickerTypes.audio], allowMultiSelection: false });
+      [picked] = await withoutLock(() => pick({ type: [pickerTypes.audio], allowMultiSelection: false }));
     } catch (e: any) {
       if (isErrorWithCode(e) && (e.code === errorCodes.OPERATION_CANCELED || e.code === errorCodes.IN_PROGRESS)) return;
       console.warn('Import: file picker failed', e);
@@ -1382,7 +1419,7 @@ function AppContent() {
   };
 
   const exportEntry = (e: Entry) =>
-    Share.share({ message: `${e.title}\n${e.date} · ${e.duration}\n\n${e.text}` });
+    withoutLock(() => Share.share({ message: `${e.title}\n${e.date} · ${e.duration}\n\n${e.text}` }));
 
   const confirmRename = (keep: boolean) => {
     if (!renaming) return;
@@ -1392,6 +1429,103 @@ function AppContent() {
     setRenaming(null);
     setSelected(updated);
   };
+
+  // ---------- app lock ----------
+  // 'ok' = the user proved who they are; 'unavailable' = this phone has nothing to check against; 'failed' = cancelled / wrong.
+  const runAuth = async (subtitle: string): Promise<'ok' | 'failed' | 'unavailable'> => {
+    if (!Biometrics) return 'unavailable';
+    try {
+      const r: any = await withoutLock<any>(() =>
+        Biometrics.authenticateWithOptions({
+          title: 'Viva Voce',
+          subtitle,
+          cancelLabel: 'Cancel',
+          fallbackLabel: 'Use PIN',
+          allowDeviceCredentials: true, // fingerprint/face first, phone PIN/pattern as the fallback
+          disableDeviceFallback: false,
+        }),
+      );
+      if (r?.success) return 'ok';
+      console.warn('App lock: not authenticated', r?.error, r?.errorCode);
+      return NO_SECURITY_RE.test(String(r?.error ?? '')) ? 'unavailable' : 'failed';
+    } catch (err: any) {
+      console.warn('App lock: prompt error', err);
+      return NO_SECURITY_RE.test(String(err?.message ?? err)) ? 'unavailable' : 'failed';
+    }
+  };
+
+  const lockNow = () => {
+    // dialogs and sheets are separate windows on Android, so close them all rather than rely on covering them
+    setSelected(null);
+    setSettingsOpen(false);
+    setLicensesOpen(false);
+    setMenuOpen(false);
+    setDeleting(null);
+    setRenaming(null);
+    setSearchOpen(false);
+    setQuery('');
+    setLockMsg('');
+    setLocked(true);
+  };
+
+  const tryUnlock = async () => {
+    if (authBusyRef.current || !lockedRef.current || AppState.currentState !== 'active') return;
+    authBusyRef.current = true;
+    setLockMsg('');
+    try {
+      const res = await runAuth('Unlock to see your transcripts');
+      if (res === 'ok') {
+        setLocked(false);
+      } else if (res === 'unavailable') {
+        // The phone no longer has a screen lock / fingerprint to check against. Staying locked would lock the user out
+        // of their own transcripts for good, and without a phone lock the app lock protects nothing anyway.
+        setAppLock(false);
+        setLocked(false);
+        setStatus('App lock turned off: this phone has no screen lock set up.');
+      } else {
+        setLockMsg('Not unlocked yet. Tap Unlock to try again.');
+      }
+    } finally {
+      authBusyRef.current = false;
+    }
+  };
+
+  const toggleAppLock = async (on: boolean) => {
+    if (!on) {
+      setAppLock(false);
+      return;
+    }
+    if (!Biometrics) {
+      Alert.alert('App lock unavailable', 'This build does not include the app-lock component yet.');
+      return;
+    }
+    // prove it works before turning it on, so a broken setup can never lock the user out
+    const res = await runAuth('Confirm to turn on app lock');
+    if (res === 'ok') setAppLock(true);
+    else if (res === 'unavailable')
+      Alert.alert('Set up a screen lock first', 'Add a fingerprint, PIN or pattern in your phone settings, then try again.');
+  };
+
+  // lock when the app goes to the background; prompt again when it comes back
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', st => {
+      if (st === 'background' && appLockRef.current && !suppressLockRef.current && !authBusyRef.current) {
+        lockNow();
+      } else if (st === 'active' && lockedRef.current && appLockRef.current) {
+        tryUnlock();
+      }
+    });
+    return () => sub.remove();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // cold start: once settings are read, either open straight away or ask for authentication
+  useEffect(() => {
+    if (!loaded || !locked) return;
+    if (!appLock || !Biometrics) setLocked(false);
+    else tryUnlock();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [loaded, locked]);
 
   // ---------- delete ----------
   // Removes an audio file that an entry explicitly points to. A file that is already gone counts as deleted.
@@ -1892,6 +2026,26 @@ function AppContent() {
                     Applies to new recordings, after they are transcribed. Audio you have already saved is never
                     deleted by changing this, and audio from a failed transcription is always kept.
                   </Text>
+                  <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>APP LOCK</Text>
+                  <View style={s.group}>
+                    <MenuRow
+                      icon="◈"
+                      title="Lock the app"
+                      sub="FINGERPRINT, FACE OR PHONE PIN"
+                      onPress={() => toggleAppLock(!appLock)}
+                      right={
+                        <Switch
+                          value={appLock}
+                          onValueChange={toggleAppLock}
+                          trackColor={{ false: C.faint, true: C.amber }}
+                          thumbColor={C.canvas}
+                        />
+                      }
+                    />
+                  </View>
+                  <Text style={[s.help, { marginLeft: 4, marginTop: 8 }]}>
+                    Viva Voce locks whenever you leave it and asks you to unlock when you come back.
+                  </Text>
                   <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>SPEECH MODEL</Text>
                   <View style={s.group}>
                     <MenuRow
@@ -2029,6 +2183,31 @@ function AppContent() {
                 )}
               </ScrollView>
              </Animated.View>
+          )}
+        </View>
+      </Modal>
+
+      {/* Lock screen: a full-screen Modal is drawn above every other dialog and sheet */}
+      <Modal visible={locked} animationType="none" statusBarTranslucent onRequestClose={noop}>
+        <View style={{ flex: 1, backgroundColor: C.canvas, alignItems: 'center', justifyContent: 'center', padding: 32 }}>
+          <View style={[s.menuIcon, { width: 64, height: 64, borderRadius: 20 }]}>
+            <Text style={{ color: C.amber, fontSize: 28 }}>◈</Text>
+          </View>
+          <Text style={[s.mono9, { color: C.amber, letterSpacing: 2, marginTop: 24 }]}>LOCKED</Text>
+          <Text style={[s.menuTitle, { fontSize: 18, marginTop: 4 }]}>Viva Voce</Text>
+          {loaded && (
+            <>
+              <Text style={[s.help, { textAlign: 'center', marginTop: 8 }]}>
+                {lockMsg || 'Unlock to see your transcripts.'}
+              </Text>
+              <Pressable
+                style={[s.btn, s.btnStack, { backgroundColor: C.amber, marginTop: 24, alignSelf: 'stretch' }]}
+                onPress={tryUnlock}
+                accessibilityLabel="Unlock"
+              >
+                <Text style={[s.btnText, { color: C.canvas }]}>UNLOCK</Text>
+              </Pressable>
+            </>
           )}
         </View>
       </Modal>
