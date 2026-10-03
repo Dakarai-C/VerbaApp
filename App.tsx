@@ -59,6 +59,10 @@ const IMPORT_FREE_SPACE_MARGIN = 50 * 1000 * 1000; // keep this much free after 
 const MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin';
 const MODEL_MIN_BYTES = 70000000; // ggml-tiny.en.bin is about 75 MB; anything smaller is a partial file
 
+// Test clip for "Transcribe test file": downloaded on first use, then it works offline. 11 s, 16 kHz mono 16-bit, 352,078 bytes.
+const SAMPLE_URL = 'https://raw.githubusercontent.com/ggml-org/whisper.cpp/master/samples/jfk.wav';
+const SAMPLE_MIN_BYTES = 300000; // anything smaller is a partial or error page
+
 // Design tokens from the Figma file
 const C = {
   canvas: '#0d0d0f',
@@ -76,6 +80,55 @@ const C = {
   red: '#e05252',
 };
 const MONO = 'monospace'; // swap for Azeret Mono once the font is bundled
+
+// ---------- sound effects ----------
+// Short clips bundled with the app in android/app/src/main/res/raw/. Use these names, in any format Android plays
+// (mp3, ogg, wav); the extension is ignored. A clip that is missing is skipped silently, so the app works without them.
+type SfxName = 'tap' | 'error' | 'record' | 'delete' | 'toggle';
+const SFX_FILES: Record<SfxName, string> = {
+  tap: 'sfx_tap',
+  error: 'sfx_error',
+  record: 'sfx_record', // plays when recording starts and again when it stops
+  delete: 'sfx_delete',
+  toggle: 'sfx_toggle', // plays when a switch is turned ON
+};
+const sfxBank: Partial<Record<SfxName, Sound>> = {};
+let sfxEnabled = true; // the Settings switch
+let sfxMuted = false; // true while the microphone is open, so effects never end up in a recording
+let sfxStarted = false;
+
+function sfxInit() {
+  if (sfxStarted) return;
+  sfxStarted = true;
+  (Object.keys(SFX_FILES) as SfxName[]).forEach(name => {
+    const snd: Sound = new Sound(SFX_FILES[name], Sound.MAIN_BUNDLE, (err: any) => {
+      if (err) {
+        console.warn(`Sound effect "${name}" not loaded: is ${SFX_FILES[name]} in android/app/src/main/res/raw?`);
+        return;
+      }
+      sfxBank[name] = snd;
+    });
+  });
+}
+
+// Fire-and-forget for most effects. The returned promise resolves when the clip ends (or after 1.5 s at most), so the
+// recording cue can be awaited. `force` plays even while muted; only the recording cues use it.
+function playSfx(name: SfxName, force = false): Promise<void> {
+  const snd = sfxBank[name];
+  if (!snd || !sfxEnabled || (sfxMuted && !force)) return Promise.resolve();
+  return new Promise<void>(resolve => {
+    const t = setTimeout(resolve, 1500);
+    try {
+      snd.stop(() => snd.play(() => {
+        clearTimeout(t);
+        resolve();
+      }));
+    } catch {
+      clearTimeout(t);
+      resolve();
+    }
+  });
+}
 
 // Android system-bar inset (3-button / gesture nav). React Native core has no inset API on Android
 // (its SafeAreaView is a no-op there), so use react-native-safe-area-context when it is installed.
@@ -250,13 +303,13 @@ function friendlyFsError(e: any): string {
 // Turns a failed download into a message a person can act on. The raw error is only ever logged, never shown.
 // No network-status library: when the phone is offline the DNS lookup itself fails, and that is the signal.
 // The patterns cover the Android/Java wording RNFS passes through, plus the errors thrown by downloadModel itself.
-function friendlyNetError(e: any): string {
+function friendlyNetError(e: any, what = 'speech model', size = 'about 75 MB'): string {
   const m = String(e?.message ?? e);
   if (/ENOSPC|No space left/i.test(m)) {
-    return 'Not enough free storage for the speech model (about 75 MB). Free up some space and try again.';
+    return `Not enough free storage for the ${what} (${size}). Free up some space and try again.`;
   }
   if (/UnknownHost|resolve host|ENOTFOUND|EAI_AGAIN|nodename nor servname|No address associated/i.test(m)) {
-    return 'You appear to be offline. Connect to Wi-Fi or mobile data to download the speech model. Everything else in Viva Voce works offline.';
+    return `You appear to be offline. Connect to Wi-Fi or mobile data to download the ${what}. Everything else in Viva Voce works offline.`;
   }
   if (/time(d)?[ -]?out/i.test(m)) {
     return 'The connection timed out. Check your signal and try again, ideally on Wi-Fi.';
@@ -268,7 +321,7 @@ function friendlyNetError(e: any): string {
   if (status) {
     const code = Number(status[1]);
     if (code === 404 || code === 403 || code === 410) {
-      return 'The speech model could not be found on the download server. The link may have changed.';
+      return `The ${what} could not be found on the download server. The link may have changed.`;
     }
     if (code === 429 || code >= 500) return 'The download server is busy or unavailable. Please try again later.';
     return `The download server refused the request (code ${code}). Please try again later.`;
@@ -319,9 +372,13 @@ function Waveform({ active, levelRef }: { active: boolean; levelRef: React.Mutab
   );
 }
 
-function MenuRow(p: { icon: string; title: string; sub: string; onPress: () => void; right?: React.ReactNode }) {
+function MenuRow(p: { icon: string; title: string; sub: string; onPress: () => void; right?: React.ReactNode; silent?: boolean }) {
   return (
-    <Pressable onPress={p.onPress} style={({ pressed }) => [s.menuRow, pressed && { backgroundColor: '#ffffff0d' }]}>
+    <Pressable
+      onPress={() => {
+        if (!p.silent) playSfx('tap'); // switches and the record row have their own sounds
+        p.onPress();
+      }} style={({ pressed }) => [s.menuRow, pressed && { backgroundColor: '#ffffff0d' }]}>
       <View style={s.menuIcon}>
         <Text style={{ color: C.amber, fontSize: 16 }}>{p.icon}</Text>
       </View>
@@ -343,7 +400,10 @@ function PlayButton(p: { playing: boolean; loading: boolean; disabled: boolean; 
   const fg = p.playing || p.loading ? C.canvas : C.muted;
   return (
     <Pressable
-      onPress={p.onPress}
+      onPress={() => {
+        playSfx('tap');
+        p.onPress();
+      }}
       disabled={p.disabled}
       hitSlop={8}
       accessibilityRole="button"
@@ -475,6 +535,8 @@ function AppContent() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [renaming, setRenaming] = useState<Entry | null>(null);
   const [draftName, setDraftName] = useState('');
+  const [sfxOn, setSfxOn] = useState(true); // Settings > Sound effects
+  const startingRef = useRef(false); // a recording is about to start (the start cue is still playing)
   const [deleting, setDeleting] = useState<Entry | null>(null); // entry the delete dialog is open for
   const [deleteBusy, setDeleteBusy] = useState(false);
   const deleteBusyRef = useRef(false);
@@ -533,6 +595,19 @@ function AppContent() {
   const entriesRef = useRef<Entry[]>([]);
   entriesRef.current = entries;
 
+  useEffect(() => {
+    sfxInit();
+  }, []);
+  useEffect(() => {
+    sfxEnabled = sfxOn;
+  }, [sfxOn]);
+  useEffect(() => {
+    sfxMuted = recording;
+  }, [recording]);
+  useEffect(() => {
+    if (status.startsWith('Error')) playSfx('error');
+  }, [status]);
+
   const downloadJobRef = useRef<number | null>(null);
   const cancelledRef = useRef(false);
 
@@ -565,6 +640,7 @@ function AppContent() {
 
   const playbackFailed = (why: string) => {
     console.warn('Playback failed:', why);
+    playSfx('error');
     stopPlayback();
     Alert.alert('Audio unavailable', 'The audio for this recording is missing or cannot be played.');
   };
@@ -791,6 +867,7 @@ function AppContent() {
     [entries, q],
   );
   const toggleSearch = () => {
+    playSfx('tap');
     setSearchOpen(v => !v);
     setQuery('');
   };
@@ -1042,6 +1119,7 @@ function AppContent() {
       try {
         if (await RNFS.exists(SETTINGS_PATH)) {
           const st = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
+          if (typeof st.sfx === 'boolean') setSfxOn(st.sfx);
           if (typeof st.appLock === 'boolean') {
             lockOn = st.appLock;
             setAppLock(st.appLock);
@@ -1069,8 +1147,8 @@ function AppContent() {
 
   useEffect(() => {
     if (!loaded) return;
-    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode, nameCounter, appLock }), 'utf8').catch(() => {});
-  }, [deleteAudio, showTimestamps, batchMode, nameCounter, appLock, loaded]);
+    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode, nameCounter, appLock, sfx: sfxOn }), 'utf8').catch(() => {});
+  }, [deleteAudio, showTimestamps, batchMode, nameCounter, appLock, sfxOn, loaded]);
 
   // re-check the model whenever Settings is opened
   useEffect(() => {
@@ -1101,12 +1179,62 @@ function AppContent() {
     ) : null;
 
   // ---------- test file ----------
+  // Downloads the test clip to a temporary name and only moves it into place once it checks out as a real WAV.
+  const downloadSample = async (): Promise<boolean> => {
+    setLoading(true);
+    setStatus('Downloading test file...');
+    const part = `${AUDIO_PATH}.part`;
+    try {
+      await RNFS.unlink(part).catch(() => {});
+      const res = await RNFS.downloadFile({ fromUrl: SAMPLE_URL, toFile: part }).promise;
+      if (res.statusCode !== 200) throw new Error(`Server answered ${res.statusCode}`);
+      const size = Number((await RNFS.stat(part)).size);
+      if (size < SAMPLE_MIN_BYTES) throw new Error('Download was incomplete');
+      const info = parseWav(fromBase64(await RNFS.read(part, 32768, 0, 'base64')), size);
+      if (!info || info.rate !== SAMPLE_RATE || info.channels !== 1 || info.bits !== 16) {
+        throw new Error('Download was incomplete');
+      }
+      if (await RNFS.exists(AUDIO_PATH)) await RNFS.unlink(AUDIO_PATH);
+      await RNFS.moveFile(part, AUDIO_PATH);
+      return true;
+    } catch (e: any) {
+      RNFS.unlink(part).catch(() => {});
+      console.warn('Sample download failed:', e);
+      setStatus(`Error: ${friendlyNetError(e, 'test file', 'about 350 KB')}`);
+      return false;
+    } finally {
+      setLoading(false);
+    }
+  };
+
   const transcribeFile = async () => {
+    let haveSample = false;
+    try {
+      // no point downloading a clip the app cannot transcribe yet
+      if (!ctxRef.current && !(await RNFS.exists(MODEL_PATH))) {
+        setStatus('Error: Speech model not downloaded. Open Settings > Speech model to get it.');
+        return;
+      }
+      haveSample = await RNFS.exists(AUDIO_PATH);
+    } catch {}
+    if (!haveSample) {
+      Alert.alert(
+        'Download test file?',
+        'The test file is a short JFK speech clip (about 350 KB). It downloads once; after that the test works offline.',
+        [
+          { text: 'Cancel', style: 'cancel' },
+          {
+            text: 'Download',
+            onPress: async () => {
+              if (await downloadSample()) transcribeFile();
+            },
+          },
+        ],
+      );
+      return;
+    }
     setLoading(true);
     try {
-      if (!(await RNFS.exists(AUDIO_PATH))) {
-        throw new Error(`Audio not found at ${AUDIO_PATH}`);
-      }
       const ctx = await getContext();
       setStatus('Transcribing...');
       const start = Date.now();
@@ -1162,6 +1290,7 @@ function AppContent() {
     transcriberRef.current = null;
     setRecording(false);
     setStatus('Stopped');
+    playSfx('record', true);
     addEntry(liveTextRef.current, elapsedRef.current, undefined, undefined, { source: 'live' });
     liveTextRef.current = '';
     setText('');
@@ -1185,6 +1314,7 @@ function AppContent() {
         await adapter?.stop();
         await adapter?.release?.();
       } catch {}
+      playSfx('record', true); // the microphone is closed now, so this cannot be recorded
 
       const total = bytesRef.current;
       seconds = total / BYTES_PER_SEC;
@@ -1446,12 +1576,19 @@ function AppContent() {
       else await stopLive();
       return;
     }
-    stopPlayback(); // the microphone and playback should not compete
-    if (!(await ensureMic())) return;
-    setText('');
-    activeModeRef.current = batchMode ? 'batch' : 'live';
-    if (batchMode) await startBatch();
-    else await startLive();
+    if (startingRef.current) return; // a second tap while the start cue is playing
+    startingRef.current = true;
+    try {
+      stopPlayback(); // the microphone and playback should not compete
+      if (!(await ensureMic())) return;
+      setText('');
+      activeModeRef.current = batchMode ? 'batch' : 'live';
+      await playSfx('record', true); // the cue finishes BEFORE the microphone opens, so it is not recorded
+      if (batchMode) await startBatch();
+      else await startLive();
+    } finally {
+      startingRef.current = false;
+    }
   };
 
   const exportEntry = (e: Entry) =>
@@ -1464,6 +1601,14 @@ function AppContent() {
     setEntries(cur => cur.map(e => (e.id === updated.id ? updated : e)));
     setRenaming(null);
     setSelected(updated);
+  };
+
+  const toggleSfx = (on: boolean) => {
+    setSfxOn(on);
+    if (on) {
+      sfxEnabled = true; // the effect that syncs this runs after render; the confirmation should play now
+      playSfx('toggle');
+    }
   };
 
   // ---------- app lock ----------
@@ -1537,7 +1682,10 @@ function AppContent() {
     }
     // prove it works before turning it on, so a broken setup can never lock the user out
     const res = await runAuth('Confirm to turn on app lock');
-    if (res === 'ok') setAppLock(true);
+    if (res === 'ok') {
+      setAppLock(true);
+      playSfx('toggle');
+    }
     else if (res === 'unavailable')
       Alert.alert('Set up a screen lock first', 'Add a fingerprint, PIN or pattern in your phone settings, then try again.');
   };
@@ -1606,6 +1754,7 @@ function AppContent() {
       } catch (err) {
         console.warn('Delete: could not save the updated list', err);
         setDeleting(null);
+        playSfx('error');
         Alert.alert('Could not delete', 'Your transcript was not deleted. Please try again.');
         return;
       }
@@ -1628,6 +1777,7 @@ function AppContent() {
       }
       setDeleting(null);
       setStatus(`Deleted "${target.title}"`);
+      playSfx('delete');
       if (audioProblem) {
         Alert.alert(
           'Transcript deleted',
@@ -1746,7 +1896,7 @@ function AppContent() {
                 accessibilityLabel="Search transcripts"
               />
               {!!query && (
-                <Pressable onPress={() => setQuery('')} hitSlop={10} accessibilityLabel="Clear search">
+                <Pressable onPress={() => { playSfx('tap'); setQuery(''); }} hitSlop={10} accessibilityLabel="Clear search">
                   <Text style={{ color: C.muted, fontSize: 14 }}>✕</Text>
                 </Pressable>
               )}
@@ -1766,7 +1916,10 @@ function AppContent() {
                 <View key={e.id} style={s.card}>
                   <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
                     <Pressable
-                      onPress={() => openEntry(e)}
+                      onPress={() => {
+                        playSfx('tap');
+                        openEntry(e);
+                      }}
                       style={({ pressed }) => [{ flex: 1, minWidth: 0 }, pressed && { opacity: 0.7 }]}
                     >
                       <Text style={s.cardTitle} numberOfLines={1}>
@@ -1812,12 +1965,22 @@ function AppContent() {
           <Text style={{ color: C.amber, fontSize: 16 }}>▤</Text>
           <Text style={[s.mono9, { color: C.amber, letterSpacing: 1 }]}>HOME</Text>
         </View>
-        <Pressable onPress={() => setMenuOpen(true)} accessibilityLabel="Add audio" style={s.fab}>
+        <Pressable
+          onPress={() => {
+            playSfx('tap');
+            setMenuOpen(true);
+          }}
+          accessibilityLabel="Add audio"
+          style={s.fab}
+        >
           <Text style={{ color: C.amber, fontSize: 28, lineHeight: 30 }}>+</Text>
         </Pressable>
         <Pressable
           style={s.navItem}
-          onPress={() => setSettingsOpen(true)}
+          onPress={() => {
+            playSfx('tap');
+            setSettingsOpen(true);
+          }}
           accessibilityLabel="Settings"
         >
           <Text style={{ color: C.faint, fontSize: 16 }}>◈</Text>
@@ -1863,11 +2026,19 @@ function AppContent() {
                 icon="∿"
                 title="Toggle real-time"
                 sub="LIVE TRANSCRIPTION"
-                onPress={() => !recording && !loading && setBatchMode(v => !v)}
+                silent
+                onPress={() => {
+                  if (recording || loading) return;
+                  if (batchMode) playSfx('toggle'); // batch -> real-time means the switch is going ON
+                  setBatchMode(v => !v);
+                }}
                 right={
                   <Switch
                     value={!batchMode}
-                    onValueChange={v => setBatchMode(!v)}
+                    onValueChange={v => {
+                      if (v) playSfx('toggle');
+                      setBatchMode(!v);
+                    }}
                     disabled={recording || loading}
                     trackColor={{ false: C.faint, true: C.amber }}
                     thumbColor={C.canvas}
@@ -1878,6 +2049,7 @@ function AppContent() {
                 icon="●"
                 title="New recording"
                 sub="START CAPTURING NOW"
+                silent
                 onPress={() => {
                   setMenuOpen(false);
                   if (!recording && !loading) toggleRecording();
@@ -1923,7 +2095,10 @@ function AppContent() {
             <View style={s.btnRow}>
               <Pressable
                 style={[s.btn, { backgroundColor: nameChanged ? C.amber : C.faint }]}
-                onPress={() => confirmRename(!nameChanged)}
+                onPress={() => {
+                  playSfx('tap');
+                  confirmRename(!nameChanged);
+                }}
                 accessibilityLabel={nameChanged ? 'Save name' : 'Keep name'}
               >
                 <Text style={[s.btnText, { color: nameChanged ? C.canvas : C.muted }]}>
@@ -1981,7 +2156,10 @@ function AppContent() {
               <Pressable
                 style={[s.btn, s.btnStack, { backgroundColor: C.faint }]}
                 disabled={deleteBusy}
-                onPress={() => setDeleting(null)}
+                onPress={() => {
+                  playSfx('tap');
+                  setDeleting(null);
+                }}
                 accessibilityLabel="Cancel"
               >
                 <Text style={[s.btnText, { color: C.muted }]}>CANCEL</Text>
@@ -2047,11 +2225,18 @@ function AppContent() {
                       icon="⌫"
                       title="Delete audio after transcription"
                       sub="KEEP TRANSCRIPT ONLY"
-                      onPress={() => setDeleteAudio(v => !v)}
+                      silent
+                      onPress={() => {
+                        if (!deleteAudio) playSfx('toggle');
+                        setDeleteAudio(v => !v);
+                      }}
                       right={
                         <Switch
                           value={deleteAudio}
-                          onValueChange={setDeleteAudio}
+                          onValueChange={v => {
+                            if (v) playSfx('toggle');
+                            setDeleteAudio(v);
+                          }}
                           trackColor={{ false: C.faint, true: C.amber }}
                           thumbColor={C.canvas}
                         />
@@ -2062,12 +2247,31 @@ function AppContent() {
                     Applies to new recordings, after they are transcribed. Audio you have already saved is never
                     deleted by changing this, and audio from a failed transcription is always kept.
                   </Text>
+                  <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>SOUNDS</Text>
+                  <View style={s.group}>
+                    <MenuRow
+                      icon="♪"
+                      title="Sound effects"
+                      sub="TAPS, ALERTS AND RECORDING CUES"
+                      silent
+                      onPress={() => toggleSfx(!sfxOn)}
+                      right={
+                        <Switch
+                          value={sfxOn}
+                          onValueChange={toggleSfx}
+                          trackColor={{ false: C.faint, true: C.amber }}
+                          thumbColor={C.canvas}
+                        />
+                      }
+                    />
+                  </View>
                   <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>APP LOCK</Text>
                   <View style={s.group}>
                     <MenuRow
                       icon="◈"
                       title="Lock the app"
                       sub="FINGERPRINT, FACE OR PHONE PIN"
+                      silent
                       onPress={() => toggleAppLock(!appLock)}
                       right={
                         <Switch
@@ -2157,11 +2361,14 @@ function AppContent() {
                   </Text>
                 </View>
                 <View style={{ flexDirection: 'row', gap: 8 }}>
-                  <Pressable onPress={() => exportEntry(selected)} style={s.exportBtn}>
+                  <Pressable onPress={() => { playSfx('tap'); exportEntry(selected); }} style={s.exportBtn}>
                     <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
                   </Pressable>
                   <Pressable
-                    onPress={() => setDeleting(selected)}
+                    onPress={() => {
+                      playSfx('tap');
+                      setDeleting(selected);
+                    }}
                     style={[s.exportBtn, { borderColor: `${C.red}66` }]}
                     accessibilityLabel="Delete transcription"
                   >
@@ -2190,7 +2397,10 @@ function AppContent() {
                   <Text style={[s.mono9, { letterSpacing: 1.5 }]}>TIMESTAMPS</Text>
                   <Switch
                     value={showTimestamps}
-                    onValueChange={setShowTimestamps}
+                    onValueChange={v => {
+                      if (v) playSfx('toggle');
+                      setShowTimestamps(v);
+                    }}
                     trackColor={{ false: C.faint, true: C.amber }}
                     thumbColor={C.canvas}
                   />
