@@ -247,6 +247,41 @@ function friendlyFsError(e: any): string {
     : m;
 }
 
+// Turns a failed download into a message a person can act on. The raw error is only ever logged, never shown.
+// No network-status library: when the phone is offline the DNS lookup itself fails, and that is the signal.
+// The patterns cover the Android/Java wording RNFS passes through, plus the errors thrown by downloadModel itself.
+function friendlyNetError(e: any): string {
+  const m = String(e?.message ?? e);
+  if (/ENOSPC|No space left/i.test(m)) {
+    return 'Not enough free storage for the speech model (about 75 MB). Free up some space and try again.';
+  }
+  if (/UnknownHost|resolve host|ENOTFOUND|EAI_AGAIN|nodename nor servname|No address associated/i.test(m)) {
+    return 'You appear to be offline. Connect to Wi-Fi or mobile data to download the speech model. Everything else in Viva Voce works offline.';
+  }
+  if (/time(d)?[ -]?out/i.test(m)) {
+    return 'The connection timed out. Check your signal and try again, ideally on Wi-Fi.';
+  }
+  if (/SSL|certificate|handshake/i.test(m)) {
+    return 'A secure connection could not be made. Check the phone\'s date and time, and that you are not on a Wi-Fi network that needs a sign-in page.';
+  }
+  const status = /Server answered (\d+)/.exec(m);
+  if (status) {
+    const code = Number(status[1]);
+    if (code === 404 || code === 403 || code === 410) {
+      return 'The speech model could not be found on the download server. The link may have changed.';
+    }
+    if (code === 429 || code >= 500) return 'The download server is busy or unavailable. Please try again later.';
+    return `The download server refused the request (code ${code}). Please try again later.`;
+  }
+  if (/incomplete|unexpected end|Connection (closed|reset|abort)|ECONNRESET|Broken pipe|Software caused/i.test(m)) {
+    return 'The download was interrupted before it finished. Check your connection and try again.';
+  }
+  if (/ConnectException|Failed to connect|ECONNREFUSED|Unreachable|Network request failed|SocketException/i.test(m)) {
+    return 'Could not reach the download server. Check your Wi-Fi or mobile data and try again.';
+  }
+  return 'The download failed. Please try again.';
+}
+
 // An entry's audioFile must be a bare file name. Anything with a path in it is never touched.
 const isPlainFileName = (n: unknown): n is string =>
   typeof n === 'string' && n.length > 0 && !/[\\/]/.test(n) && n !== '.' && n !== '..';
@@ -927,7 +962,8 @@ function AppContent() {
       if (cancelledRef.current) {
         setModelState('missing');
       } else {
-        setModelError(e?.message ?? String(e));
+        console.warn('Model download failed:', e);
+        setModelError(friendlyNetError(e));
         setModelState('error');
       }
     }
