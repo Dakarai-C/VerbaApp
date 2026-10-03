@@ -1,6 +1,7 @@
 import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Animated,
   Easing,
   Keyboard,
@@ -30,6 +31,14 @@ const REC_PATH = `${RNFS.ExternalDirectoryPath}/recording.wav`;
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SEC = SAMPLE_RATE * 2; // 16-bit mono
 const MAX_SECONDS = 600; // batch recordings stop automatically at 10 minutes
+
+// Saved data lives in the app's private folder, so transcripts survive closing the app.
+const ENTRIES_PATH = `${RNFS.DocumentDirectoryPath}/entries.json`;
+const SETTINGS_PATH = `${RNFS.DocumentDirectoryPath}/settings.json`;
+
+// Speech model: downloaded once from Hugging Face, then everything runs offline.
+const MODEL_URL = 'https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-tiny.en.bin';
+const MODEL_MIN_BYTES = 70000000; // ggml-tiny.en.bin is about 75 MB; anything smaller is a partial file
 
 // Design tokens from the Figma file
 const C = {
@@ -210,6 +219,12 @@ function AppContent() {
   const [query, setQuery] = useState('');
   const [kbOpen, setKbOpen] = useState(false);
 
+  const [loaded, setLoaded] = useState(false); // saved transcripts and settings have been read
+  const [modelState, setModelState] = useState<'unknown' | 'installed' | 'missing' | 'downloading' | 'error'>('unknown');
+  const [modelBytes, setModelBytes] = useState(0);
+  const [modelProgress, setModelProgress] = useState(0); // 0..1
+  const [modelError, setModelError] = useState('');
+
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
   const adapterRef = useRef<any>(null); // batch mode
@@ -221,6 +236,9 @@ function AppContent() {
   const liveTextRef = useRef('');
   const elapsedRef = useRef(0);
   const levelRef = useRef(0);
+
+  const downloadJobRef = useRef<number | null>(null);
+  const cancelledRef = useRef(false);
 
   // timer
   useEffect(() => {
@@ -379,7 +397,7 @@ function AppContent() {
   const getContext = async () => {
     if (!ctxRef.current) {
       if (!(await RNFS.exists(MODEL_PATH))) {
-        throw new Error(`Model not found at ${MODEL_PATH}`);
+        throw new Error('Speech model not downloaded. Open Settings > Speech model to get it.');
       }
       setStatus('Loading model...');
       ctxRef.current = await initWhisper({ filePath: MODEL_PATH });
@@ -395,6 +413,151 @@ function AppContent() {
     }
     return true;
   };
+
+  // ---------- speech model: check / download ----------
+
+  const checkModel = async (): Promise<boolean> => {
+    try {
+      if (await RNFS.exists(MODEL_PATH)) {
+        const st = await RNFS.stat(MODEL_PATH);
+        if (Number(st.size) >= MODEL_MIN_BYTES) {
+          setModelBytes(Number(st.size));
+          setModelState('installed');
+          return true;
+        }
+      }
+    } catch {}
+    setModelState('missing');
+    return false;
+  };
+
+  const downloadModel = async () => {
+    if (downloadJobRef.current !== null) return;
+    cancelledRef.current = false;
+    setModelError('');
+    setModelProgress(0);
+    setModelState('downloading');
+    const part = `${MODEL_PATH}.part`; // download to a temp name so a half-finished file is never used
+    try {
+      await RNFS.unlink(part).catch(() => {});
+      const job = RNFS.downloadFile({
+        fromUrl: MODEL_URL,
+        toFile: part,
+        progressInterval: 500,
+        progress: ({ bytesWritten, contentLength }) => {
+          if (contentLength > 0) setModelProgress(bytesWritten / contentLength);
+        },
+      });
+      downloadJobRef.current = job.jobId;
+      const res = await job.promise;
+      downloadJobRef.current = null;
+      if (res.statusCode !== 200) throw new Error(`Server answered ${res.statusCode}`);
+      const st = await RNFS.stat(part);
+      if (Number(st.size) < MODEL_MIN_BYTES) throw new Error('Download was incomplete');
+      if (await RNFS.exists(MODEL_PATH)) await RNFS.unlink(MODEL_PATH);
+      await RNFS.moveFile(part, MODEL_PATH);
+      ctxRef.current = null; // load the fresh file next time
+      await checkModel();
+      setStatus('Speech model ready');
+    } catch (e: any) {
+      downloadJobRef.current = null;
+      RNFS.unlink(part).catch(() => {});
+      if (cancelledRef.current) {
+        setModelState('missing');
+      } else {
+        setModelError(e?.message ?? String(e));
+        setModelState('error');
+      }
+    }
+  };
+
+  const cancelDownload = () => {
+    cancelledRef.current = true;
+    if (downloadJobRef.current !== null) RNFS.stopDownload(downloadJobRef.current);
+  };
+
+  const confirmDownload = () =>
+    Alert.alert(
+      'Download speech model?',
+      'It is about 75 MB and downloads once. After that, viva voce works fully offline. Wi-Fi is best.',
+      [
+        { text: 'Cancel', style: 'cancel' },
+        { text: 'Download', onPress: downloadModel },
+      ],
+    );
+
+  // the Settings row: check for the model, and offer the download if it is missing
+  const onModelPress = async () => {
+    if (modelState === 'downloading') {
+      cancelDownload();
+      return;
+    }
+    const ok = await checkModel();
+    if (!ok) confirmDownload();
+  };
+
+  // ---------- saved data: transcripts + settings ----------
+
+  useEffect(() => {
+    (async () => {
+      try {
+        if (await RNFS.exists(ENTRIES_PATH)) {
+          const data = JSON.parse(await RNFS.readFile(ENTRIES_PATH, 'utf8'));
+          if (Array.isArray(data)) setEntries(data);
+        }
+      } catch {}
+      try {
+        if (await RNFS.exists(SETTINGS_PATH)) {
+          const st = JSON.parse(await RNFS.readFile(SETTINGS_PATH, 'utf8'));
+          if (typeof st.deleteAudio === 'boolean') setDeleteAudio(st.deleteAudio);
+          if (typeof st.showTimestamps === 'boolean') setShowTimestamps(st.showTimestamps);
+          if (typeof st.batchMode === 'boolean') setBatchMode(st.batchMode);
+        }
+      } catch {}
+      setLoaded(true);
+      if (!(await checkModel())) setStatus('Speech model not downloaded. Open Settings to get it.');
+    })();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // write after every change, but only once the saved copy has been read (so we never overwrite it with an empty list)
+  useEffect(() => {
+    if (!loaded) return;
+    RNFS.writeFile(ENTRIES_PATH, JSON.stringify(entries), 'utf8').catch(() => {});
+  }, [entries, loaded]);
+
+  useEffect(() => {
+    if (!loaded) return;
+    RNFS.writeFile(SETTINGS_PATH, JSON.stringify({ deleteAudio, showTimestamps, batchMode }), 'utf8').catch(() => {});
+  }, [deleteAudio, showTimestamps, batchMode, loaded]);
+
+  // re-check the model whenever Settings is opened
+  useEffect(() => {
+    if (settingsOpen && modelState !== 'downloading') checkModel();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [settingsOpen]);
+
+  const modelSub =
+    modelState === 'installed'
+      ? `INSTALLED · ${(modelBytes / 1e6).toFixed(0)} MB`
+      : modelState === 'downloading'
+      ? `DOWNLOADING ${Math.round(modelProgress * 100)}% · TAP TO CANCEL`
+      : modelState === 'error'
+      ? 'DOWNLOAD FAILED · TAP TO RETRY'
+      : modelState === 'missing'
+      ? 'NOT DOWNLOADED · TAP TO DOWNLOAD'
+      : 'CHECKING…';
+
+  const modelRight =
+    modelState === 'installed' ? (
+      <Text style={{ color: C.green, fontSize: 16 }}>✓</Text>
+    ) : modelState === 'downloading' ? (
+      <ActivityIndicator size="small" color={C.amber} />
+    ) : modelState === 'error' ? (
+      <Text style={{ color: C.red, fontSize: 16 }}>!</Text>
+    ) : modelState === 'missing' ? (
+      <Text style={{ color: C.amber, fontSize: 16 }}>↓</Text>
+    ) : null;
 
   // ---------- test file ----------
   const transcribeFile = async () => {
@@ -880,7 +1043,7 @@ function AppContent() {
               {licensesOpen ? (
                 <>
                   <Text style={[s.help, { marginBottom: 16 }]}>
-                    Transcribe runs on open-source software. Everything stays on this device.
+                    viva voce is built on open-source software. Your audio and transcripts stay on this device.
                   </Text>
                   <View style={s.group}>
                     {[
@@ -889,6 +1052,7 @@ function AppContent() {
                       ['Whisper model weights (OpenAI)', 'MIT'],
                       ['React Native', 'MIT'],
                       ['react-native-fs', 'MIT'],
+                      ['@fugood/react-native-audio-pcm-stream', 'MIT'],
                     ].map(([name, lic], i) => (
                       <View key={name} style={[s.licRow, i > 0 && { borderTopWidth: 1, borderTopColor: C.borderSubtle }]}>
                         <Text style={[s.menuTitle, { flex: 1, fontWeight: '500' }]}>{name}</Text>
@@ -916,6 +1080,24 @@ function AppContent() {
                       }
                     />
                   </View>
+                  <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>SPEECH MODEL</Text>
+                  <View style={s.group}>
+                    <MenuRow
+                      icon="◉"
+                      title="Speech model"
+                      sub={modelSub}
+                      onPress={onModelPress}
+                      right={modelRight}
+                    />
+                    {modelState === 'downloading' && (
+                      <View style={s.modelBar}>
+                        <View style={[s.modelBarFill, { width: `${Math.max(2, Math.round(modelProgress * 100))}%` }]} />
+                      </View>
+                    )}
+                  </View>
+                  {modelState === 'error' && !!modelError && (
+                    <Text style={[s.help, { marginLeft: 4, color: C.red }]}>{modelError}</Text>
+                  )}
                   <Text style={[s.mono9, { letterSpacing: 1.5, marginTop: 24, marginBottom: 8, marginLeft: 4 }]}>ABOUT</Text>
                   <View style={s.group}>
                     <MenuRow
@@ -1208,4 +1390,7 @@ const s = StyleSheet.create({
     color: C.amber,
     backgroundColor: C.amberMuted,
   },
+
+  modelBar: { height: 3, marginHorizontal: 12, marginBottom: 12, borderRadius: 2, backgroundColor: C.faint, overflow: 'hidden' },
+  modelBarFill: { height: 3, borderRadius: 2, backgroundColor: C.amber },
 });
