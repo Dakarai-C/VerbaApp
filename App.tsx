@@ -1,7 +1,10 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useEffect, useMemo, useRef, useState } from 'react';
 import {
   ActivityIndicator,
+  Animated,
+  Easing,
   Modal,
+  PanResponder,
   PermissionsAndroid,
   Pressable,
   SafeAreaView,
@@ -12,6 +15,7 @@ import {
   Switch,
   Text,
   TextInput,
+  useWindowDimensions,
   View,
 } from 'react-native';
 import RNFS from 'react-native-fs';
@@ -182,7 +186,7 @@ export default function App() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [renaming, setRenaming] = useState<Entry | null>(null);
   const [draftName, setDraftName] = useState('');
-  const [sheetExpanded, setSheetExpanded] = useState(false); // transcript sheet: tap handle to toggle
+  const [sheetExpanded, setSheetExpanded] = useState(false); // transcript sheet: settled state (drag or tap the handle)
 
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
@@ -208,10 +212,76 @@ export default function App() {
     return () => clearInterval(id);
   }, [recording]);
 
-  // always open a transcript at the normal size
+  // ---------- transcript sheet: draggable height ----------
+  // The sheet's height is an Animated.Value that follows the finger while the handle is dragged,
+  // then animates to the collapsed or expanded height on release.
+  const { height: winH } = useWindowDimensions();
+  const SHEET_MIN = Math.round(winH * 0.6); // collapsed
+  const SHEET_MAX = Math.round(winH * 0.94); // expanded
+  const boundsRef = useRef({ min: SHEET_MIN, max: SHEET_MAX });
+  boundsRef.current = { min: SHEET_MIN, max: SHEET_MAX };
+  const sheetH = useRef(new Animated.Value(SHEET_MIN)).current;
+  const sheetHVal = useRef(SHEET_MIN); // latest height, kept in sync by the listener below
+  const dragStartH = useRef(SHEET_MIN);
+
   useEffect(() => {
+    const id = sheetH.addListener(({ value }) => {
+      sheetHVal.current = value;
+    });
+    return () => sheetH.removeListener(id);
+  }, [sheetH]);
+
+  const snapSheet = (expand: boolean) => {
+    setSheetExpanded(expand);
+    Animated.timing(sheetH, {
+      toValue: expand ? boundsRef.current.max : boundsRef.current.min,
+      duration: 220,
+      easing: Easing.out(Easing.cubic),
+      useNativeDriver: false, // height is a layout property
+    }).start();
+  };
+
+  const toggleSheet = () => {
+    const { min, max } = boundsRef.current;
+    snapSheet(sheetHVal.current < (min + max) / 2);
+  };
+
+  // Only attached to the handle, so it never competes with the transcript ScrollView.
+  const sheetPan = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => true,
+        onMoveShouldSetPanResponder: () => true,
+        onPanResponderTerminationRequest: () => false,
+        onPanResponderGrant: () => {
+          sheetH.stopAnimation();
+          dragStartH.current = sheetHVal.current;
+        },
+        onPanResponderMove: (_, g) => {
+          const { min, max } = boundsRef.current;
+          // finger up (dy < 0) = taller sheet
+          sheetH.setValue(Math.max(min, Math.min(max, dragStartH.current - g.dy)));
+        },
+        onPanResponderRelease: (_, g) => {
+          if (Math.abs(g.dy) < 8) toggleSheet(); // plain tap
+          else if (Math.abs(g.vy) > 0.3) snapSheet(g.vy < 0); // fling
+          else snapSheet(g.dy < 0); // short swipe: direction decides
+        },
+        onPanResponderTerminate: () => {
+          const { min, max } = boundsRef.current;
+          snapSheet(sheetHVal.current >= (min + max) / 2);
+        },
+      }),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [],
+  );
+
+  // always open a transcript at the collapsed size
+  useEffect(() => {
+    sheetH.stopAnimation();
+    sheetH.setValue(boundsRef.current.min);
     setSheetExpanded(false);
-  }, [selected?.id]);
+  }, [selected?.id, sheetH]);
 
   // recording time left, from free storage
   useEffect(() => {
@@ -667,17 +737,16 @@ export default function App() {
                 selectTextOnFocus
                 autoCorrect={false}
                 autoCapitalize="none"
+                returnKeyType="done"
+                onSubmitEditing={() => confirmRename(false)}
                 placeholderTextColor={C.muted}
                 style={s.input}
                 accessibilityLabel="Recording file name"
               />
             </View>
             <View style={s.btnRow}>
-              <Pressable style={[s.btn, { borderWidth: 1, borderColor: C.border }]} onPress={() => confirmRename(true)}>
-                <Text style={[s.btnText, { color: C.muted }]}>KEEP NAME</Text>
-              </Pressable>
               <Pressable style={[s.btn, { backgroundColor: C.amber }]} onPress={() => confirmRename(false)}>
-                <Text style={[s.btnText, { color: C.canvas }]}>SAVE NAME</Text>
+                <Text style={[s.btnText, { color: C.canvas }]}>KEEP NAME</Text>
               </Pressable>
             </View>
           </Pressable>
@@ -775,16 +844,19 @@ export default function App() {
       >
         <Pressable style={s.overlay} onPress={() => setSelected(null)}>
           {selected && (
-            <Pressable style={[s.sheet, sheetExpanded && s.sheetExpanded]} onPress={noop}>
-              {/* Tap the handle to expand to (nearly) full screen, tap again to shrink */}
-              <Pressable
-                onPress={() => setSheetExpanded(v => !v)}
+            <Pressable onPress={noop}>
+             <Animated.View style={[s.sheet, { height: sheetH, maxHeight: winH }]}>
+              {/* Drag the handle to resize the sheet (it follows the finger); a tap also toggles */}
+              <View
+                {...sheetPan.panHandlers}
                 style={s.handleHit}
+                accessible
                 accessibilityRole="button"
                 accessibilityLabel={sheetExpanded ? 'Collapse transcript' : 'Expand transcript'}
+                onAccessibilityTap={toggleSheet}
               >
                 <View style={[s.handle, { marginVertical: 0 }]} />
-              </Pressable>
+              </View>
               <View style={s.sheetHead}>
                 <View style={{ flex: 1 }}>
                   <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>TRANSCRIPT</Text>
@@ -810,9 +882,12 @@ export default function App() {
                   />
                 </View>
               )}
+              {/* flex: 1 fills exactly the space left under the header, whatever the sheet height is */}
               <ScrollView
-                style={[{ flexShrink: 1, paddingHorizontal: 20 }, sheetExpanded && { flex: 1 }]}
-                contentContainerStyle={{ paddingVertical: 20, gap: 16 }}
+                style={{ flex: 1, paddingHorizontal: 20 }}
+                contentContainerStyle={{ paddingTop: 20, paddingBottom: 56, gap: 16 }}
+                nestedScrollEnabled
+                showsVerticalScrollIndicator
               >
                 {selected.segs ? (
                   selected.segs.map((g, i) => (
@@ -829,6 +904,7 @@ export default function App() {
                   </Text>
                 )}
               </ScrollView>
+             </Animated.View>
             </Pressable>
           )}
         </Pressable>
@@ -953,8 +1029,7 @@ const s = StyleSheet.create({
     borderBottomWidth: 0,
     borderColor: C.faint,
   },
-  sheetExpanded: { height: '94%', maxHeight: '94%' },
-  handleHit: { alignSelf: 'stretch', alignItems: 'center', paddingVertical: 14 },
+  handleHit: { alignSelf: 'stretch', alignItems: 'center', justifyContent: 'center', height: 48 }, // big grab target
   handle: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, marginVertical: 10, backgroundColor: C.faint },
   sheetHead: {
     flexDirection: 'row',
