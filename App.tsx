@@ -182,6 +182,7 @@ export default function App() {
   const [showTimestamps, setShowTimestamps] = useState(true);
   const [renaming, setRenaming] = useState<Entry | null>(null);
   const [draftName, setDraftName] = useState('');
+  const [sheetExpanded, setSheetExpanded] = useState(false); // transcript sheet: tap handle to toggle
 
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
@@ -206,6 +207,11 @@ export default function App() {
     }, 1000);
     return () => clearInterval(id);
   }, [recording]);
+
+  // always open a transcript at the normal size
+  useEffect(() => {
+    setSheetExpanded(false);
+  }, [selected?.id]);
 
   // recording time left, from free storage
   useEffect(() => {
@@ -451,6 +457,12 @@ export default function App() {
     setSelected(updated);
   };
 
+  const closeSettings = () => {
+    setSettingsOpen(false);
+    setLicensesOpen(false);
+  };
+  const noop = () => {}; // inner Pressables use this so taps on a dialog don't reach the dismiss layer
+
   const isError = status.startsWith('Error');
 
   return (
@@ -578,10 +590,15 @@ export default function App() {
       </View>
 
       {/* Add audio menu */}
-      <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
-        <View style={s.modalEnd}>
-          <Pressable style={s.backdrop} onPress={() => setMenuOpen(false)} />
-          <View style={s.menu}>
+      <Modal
+        visible={menuOpen}
+        transparent
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => setMenuOpen(false)}
+      >
+        <Pressable style={s.overlay} onPress={() => setMenuOpen(false)}>
+          <Pressable style={s.menu} onPress={noop}>
             <View style={s.menuHead}>
               <Text style={[s.mono9, { letterSpacing: 2 }]}>ADD AUDIO</Text>
               <Text style={s.menuTitle}>Choose a source</Text>
@@ -621,15 +638,23 @@ export default function App() {
                 }}
               />
             </View>
-          </View>
-        </View>
+          </Pressable>
+        </Pressable>
       </Modal>
 
       {/* Rename dialog */}
-      <Modal visible={!!renaming} transparent animationType="fade" onRequestClose={() => confirmRename(true)}>
-        <View style={[s.modalEnd, { justifyContent: 'flex-start', paddingTop: 120, paddingHorizontal: 20 }]}>
-          <Pressable style={s.backdrop} onPress={() => confirmRename(true)} />
-          <View style={s.dialog}>
+      <Modal
+        visible={!!renaming}
+        transparent
+        statusBarTranslucent
+        animationType="fade"
+        onRequestClose={() => confirmRename(true)}
+      >
+        <Pressable
+          style={[s.overlay, { justifyContent: 'flex-start', paddingTop: 120, paddingHorizontal: 20 }]}
+          onPress={() => confirmRename(true)}
+        >
+          <Pressable style={s.dialog} onPress={noop}>
             <View style={{ padding: 20 }}>
               <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>TRANSCRIPT READY</Text>
               <Text style={[s.menuTitle, { fontSize: 18, marginTop: 4 }]}>Rename this file?</Text>
@@ -655,29 +680,20 @@ export default function App() {
                 <Text style={[s.btnText, { color: C.canvas }]}>SAVE NAME</Text>
               </Pressable>
             </View>
-          </View>
-        </View>
+          </Pressable>
+        </Pressable>
       </Modal>
 
       {/* Settings sheet */}
       <Modal
         visible={settingsOpen}
         transparent
+        statusBarTranslucent
         animationType="slide"
-        onRequestClose={() => {
-          setSettingsOpen(false);
-          setLicensesOpen(false);
-        }}
+        onRequestClose={closeSettings}
       >
-        <View style={s.modalEnd}>
-          <Pressable
-            style={s.backdrop}
-            onPress={() => {
-              setSettingsOpen(false);
-              setLicensesOpen(false);
-            }}
-          />
-          <View style={s.sheet}>
+        <Pressable style={s.overlay} onPress={closeSettings}>
+          <Pressable style={s.sheet} onPress={noop}>
             <View style={s.handle} />
             <View style={[s.sheetHead, { alignItems: 'center' }]}>
               {licensesOpen && (
@@ -745,17 +761,30 @@ export default function App() {
                 </>
               )}
             </ScrollView>
-          </View>
-        </View>
+          </Pressable>
+        </Pressable>
       </Modal>
 
       {/* Transcript sheet */}
-      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
-        <View style={s.modalEnd}>
-          <Pressable style={s.backdrop} onPress={() => setSelected(null)} />
+      <Modal
+        visible={!!selected}
+        transparent
+        statusBarTranslucent
+        animationType="slide"
+        onRequestClose={() => setSelected(null)}
+      >
+        <Pressable style={s.overlay} onPress={() => setSelected(null)}>
           {selected && (
-            <View style={s.sheet}>
-              <View style={s.handle} />
+            <Pressable style={[s.sheet, sheetExpanded && s.sheetExpanded]} onPress={noop}>
+              {/* Tap the handle to expand to (nearly) full screen, tap again to shrink */}
+              <Pressable
+                onPress={() => setSheetExpanded(v => !v)}
+                style={s.handleHit}
+                accessibilityRole="button"
+                accessibilityLabel={sheetExpanded ? 'Collapse transcript' : 'Expand transcript'}
+              >
+                <View style={[s.handle, { marginVertical: 0 }]} />
+              </Pressable>
               <View style={s.sheetHead}>
                 <View style={{ flex: 1 }}>
                   <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>TRANSCRIPT</Text>
@@ -781,7 +810,10 @@ export default function App() {
                   />
                 </View>
               )}
-              <ScrollView style={{ flexShrink: 1, paddingHorizontal: 20 }} contentContainerStyle={{ paddingVertical: 20, gap: 16 }}>
+              <ScrollView
+                style={[{ flexShrink: 1, paddingHorizontal: 20 }, sheetExpanded && { flex: 1 }]}
+                contentContainerStyle={{ paddingVertical: 20, gap: 16 }}
+              >
                 {selected.segs ? (
                   selected.segs.map((g, i) => (
                     <View key={i} style={{ flexDirection: 'row', gap: 12 }}>
@@ -797,9 +829,9 @@ export default function App() {
                   </Text>
                 )}
               </ScrollView>
-            </View>
+            </Pressable>
           )}
-        </View>
+        </Pressable>
       </Modal>
     </SafeAreaView>
   );
@@ -888,8 +920,8 @@ const s = StyleSheet.create({
     borderColor: C.faint,
   },
 
-  modalEnd: { flex: 1, justifyContent: 'flex-end' },
-  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000a6' },
+  // full-screen dim layer; tapping anywhere on it (outside the dialog) dismisses
+  overlay: { flex: 1, justifyContent: 'flex-end', backgroundColor: '#000000a6' },
   menu: {
     marginHorizontal: 16,
     marginBottom: 96,
@@ -921,6 +953,8 @@ const s = StyleSheet.create({
     borderBottomWidth: 0,
     borderColor: C.faint,
   },
+  sheetExpanded: { height: '94%', maxHeight: '94%' },
+  handleHit: { alignSelf: 'stretch', alignItems: 'center', paddingVertical: 14 },
   handle: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, marginVertical: 10, backgroundColor: C.faint },
   sheetHead: {
     flexDirection: 'row',
