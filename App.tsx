@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   Animated,
+  AppState,
   Easing,
   Keyboard,
   Modal,
@@ -21,6 +22,7 @@ import {
   View,
 } from 'react-native';
 import RNFS from 'react-native-fs';
+import Sound from 'react-native-sound';
 import { errorCodes, isErrorWithCode, keepLocalCopy, pick, types as pickerTypes } from '@react-native-documents/picker';
 import { initWhisper } from 'whisper.rn';
 import { RealtimeTranscriber } from 'whisper.rn/src/realtime-transcription';
@@ -281,6 +283,129 @@ function MenuRow(p: { icon: string; title: string; sub: string; onPress: () => v
   );
 }
 
+// ---------- audio playback UI (styled after the Figma Make "Offline audio transcription" reference) ----------
+// Figma's card play button: 32px round, faint outline, muted icon; amber fill with a canvas-coloured icon while playing;
+// 25% opacity when there is no audio.
+type PlayerState = { id: string | null; status: 'idle' | 'loading' | 'playing' | 'paused'; pos: number; dur: number };
+
+function PlayButton(p: { playing: boolean; loading: boolean; disabled: boolean; onPress: () => void; label: string }) {
+  const fg = p.playing || p.loading ? C.canvas : C.muted;
+  return (
+    <Pressable
+      onPress={p.onPress}
+      disabled={p.disabled}
+      hitSlop={8}
+      accessibilityRole="button"
+      accessibilityLabel={p.label}
+      accessibilityState={{ disabled: p.disabled }}
+      style={({ pressed }) => [
+        s.playBtn,
+        {
+          backgroundColor: p.playing || p.loading ? C.amber : 'transparent',
+          borderColor: p.playing || p.loading ? C.amber : C.faint,
+          opacity: p.disabled ? 0.25 : 1,
+          transform: [{ scale: pressed ? 0.95 : 1 }],
+        },
+      ]}
+    >
+      {p.loading ? (
+        <ActivityIndicator size="small" color={fg} />
+      ) : p.playing ? (
+        <View style={{ flexDirection: 'row', gap: 4 }}>
+          <View style={{ width: 4, height: 12, borderRadius: 2, backgroundColor: fg }} />
+          <View style={{ width: 4, height: 12, borderRadius: 2, backgroundColor: fg }} />
+        </View>
+      ) : (
+        // play triangle drawn with borders (no SVG library in the project)
+        <View
+          style={{
+            marginLeft: 2,
+            borderLeftWidth: 7,
+            borderTopWidth: 4.5,
+            borderBottomWidth: 4.5,
+            borderLeftColor: fg,
+            borderTopColor: 'transparent',
+            borderBottomColor: 'transparent',
+          }}
+        />
+      )}
+    </Pressable>
+  );
+}
+
+const clamp01 = (n: number) => Math.max(0, Math.min(1, n));
+
+// Progress bar you can tap or drag. The seek happens when the finger lifts, so the audio is not re-seeked on every move.
+function SeekBar(p: { pos: number; dur: number; onSeek: (sec: number) => void }) {
+  const [scrub, setScrub] = useState<number | null>(null);
+  const [w, setW] = useState(0);
+  const wRef = useRef(0);
+  const durRef = useRef(p.dur);
+  durRef.current = p.dur;
+  const onSeekRef = useRef(p.onSeek);
+  onSeekRef.current = p.onSeek;
+  const startRatio = useRef(0);
+  const ratioRef = useRef(0);
+
+  const pan = useMemo(
+    () =>
+      PanResponder.create({
+        onStartShouldSetPanResponder: () => durRef.current > 0,
+        onMoveShouldSetPanResponder: () => durRef.current > 0,
+        onPanResponderTerminationRequest: () => false, // keep the gesture even if a ScrollView wants it
+        onPanResponderGrant: e => {
+          const r = clamp01(e.nativeEvent.locationX / (wRef.current || 1));
+          startRatio.current = r;
+          ratioRef.current = r;
+          setScrub(r * durRef.current);
+        },
+        onPanResponderMove: (_, g) => {
+          const r = clamp01(startRatio.current + g.dx / (wRef.current || 1));
+          ratioRef.current = r;
+          setScrub(r * durRef.current);
+        },
+        onPanResponderRelease: () => {
+          onSeekRef.current(ratioRef.current * durRef.current);
+          setScrub(null);
+        },
+        onPanResponderTerminate: () => setScrub(null),
+      }),
+    [],
+  );
+
+  const shown = scrub ?? p.pos;
+  const ratio = p.dur > 0 ? clamp01(shown / p.dur) : 0;
+  return (
+    <View style={{ flex: 1 }}>
+      {/* the touch target is the whole 28px-high row; children ignore touches so locationX stays relative to it */}
+      <View
+        {...pan.panHandlers}
+        style={s.seekHit}
+        onLayout={e => {
+          wRef.current = e.nativeEvent.layout.width;
+          setW(e.nativeEvent.layout.width);
+        }}
+        accessible
+        accessibilityRole="adjustable"
+        accessibilityLabel="Seek"
+        accessibilityValue={{ min: 0, max: Math.round(p.dur), now: Math.round(shown) }}
+      >
+        <View style={s.seekTrack} pointerEvents="none">
+          <View style={{ width: `${ratio * 100}%`, height: 4, borderRadius: 2, backgroundColor: C.amber }} />
+        </View>
+        <View
+          pointerEvents="none"
+          style={[s.seekThumb, { left: Math.max(0, Math.min(w - 12, ratio * w - 6)), opacity: p.dur > 0 ? 1 : 0.4 }]}
+        />
+      </View>
+      <View style={s.seekTimes}>
+        <Text style={[s.mono9, { color: C.amber }]}>{fmt(shown)}</Text>
+        <Text style={s.mono9}>{fmt(p.dur)}</Text>
+      </View>
+    </View>
+  );
+}
+
 function AppContent() {
   const bottomInset = useBottomInset();
   const [status, setStatus] = useState('Ready');
@@ -331,6 +456,139 @@ function AppContent() {
 
   const downloadJobRef = useRef<number | null>(null);
   const cancelledRef = useRef(false);
+
+  // ---------- audio playback ----------
+  // One shared player: playing a different recording replaces the current one. The Sound object lives in a ref;
+  // `player` is just what the UI shows.
+  const [player, setPlayer] = useState<PlayerState>({ id: null, status: 'idle', pos: 0, dur: 0 });
+  const playerRef = useRef(player);
+  playerRef.current = player;
+  const soundRef = useRef<Sound | null>(null);
+  const loadTokenRef = useRef(0); // lets a slow load be cancelled by a newer tap
+  const lastSeekRef = useRef(0);
+
+  const releaseSound = () => {
+    const snd = soundRef.current;
+    soundRef.current = null;
+    if (snd) {
+      try {
+        snd.release();
+      } catch {}
+    }
+  };
+
+  // stop and unload whatever is playing (also used before recording and, later, before deleting)
+  const stopPlayback = () => {
+    loadTokenRef.current++;
+    releaseSound();
+    setPlayer({ id: null, status: 'idle', pos: 0, dur: 0 });
+  };
+
+  const playbackFailed = (why: string) => {
+    console.warn('Playback failed:', why);
+    stopPlayback();
+    Alert.alert('Audio unavailable', 'The audio for this recording is missing or cannot be played.');
+  };
+
+  const startPlayback = () => {
+    const snd = soundRef.current;
+    if (!snd) return;
+    setPlayer(p => ({ ...p, status: 'playing' }));
+    snd.play(ok => {
+      // called once when playback reaches the end (or fails)
+      if (soundRef.current !== snd) return;
+      if (ok) {
+        snd.setCurrentTime(0);
+        setPlayer(p => ({ ...p, status: 'paused', pos: 0 }));
+      } else {
+        playbackFailed('player reported an error');
+      }
+    });
+  };
+
+  const togglePlay = async (e: Entry) => {
+    if (!e.audioFile) return;
+    const cur = playerRef.current;
+    if (cur.id === e.id && soundRef.current) {
+      if (cur.status === 'playing') {
+        soundRef.current.pause();
+        setPlayer(p => ({ ...p, status: 'paused' }));
+      } else if (cur.status === 'paused') {
+        startPlayback();
+      }
+      return;
+    }
+    if (cur.id === e.id && cur.status === 'loading') return;
+
+    const token = ++loadTokenRef.current;
+    releaseSound();
+    setPlayer({ id: e.id, status: 'loading', pos: 0, dur: 0 });
+    const path = `${AUDIO_DIR}/${e.audioFile}`;
+    let exists = false;
+    try {
+      exists = await RNFS.exists(path);
+    } catch {}
+    if (token !== loadTokenRef.current) return;
+    if (!exists) {
+      playbackFailed(`file not found: ${path}`);
+      return;
+    }
+    // '' as basePath: the path is already absolute
+    const snd: Sound = new Sound(path, '', (err: any) => {
+      if (token !== loadTokenRef.current) {
+        snd.release();
+        return;
+      }
+      if (err) {
+        snd.release();
+        playbackFailed(`could not load: ${JSON.stringify(err)}`);
+        return;
+      }
+      soundRef.current = snd;
+      setPlayer({ id: e.id, status: 'paused', pos: 0, dur: Math.max(0, snd.getDuration()) });
+      startPlayback();
+    });
+  };
+
+  const seekTo = (sec: number) => {
+    const snd = soundRef.current;
+    if (!snd) return;
+    const d = playerRef.current.dur;
+    const t = Math.max(0, d > 0 ? Math.min(sec, d - 0.05) : sec);
+    lastSeekRef.current = Date.now();
+    snd.setCurrentTime(t);
+    setPlayer(p => ({ ...p, pos: t }));
+  };
+
+  // progress: ask the native player for its position a few times a second while playing
+  useEffect(() => {
+    if (player.status !== 'playing') return;
+    const id = setInterval(() => {
+      const snd = soundRef.current;
+      if (!snd) return;
+      snd.getCurrentTime((t: number) => {
+        if (soundRef.current !== snd || Date.now() - lastSeekRef.current < 500) return; // ignore a stale reading right after a seek
+        setPlayer(p => (p.status === 'playing' ? { ...p, pos: t } : p));
+      });
+    }, 250);
+    return () => clearInterval(id);
+  }, [player.status]);
+
+  // pause when the app goes to the background; release the player when the app screen unmounts
+  useEffect(() => {
+    const sub = AppState.addEventListener('change', st => {
+      if (st !== 'active' && playerRef.current.status === 'playing') {
+        soundRef.current?.pause();
+        setPlayer(p => ({ ...p, status: 'paused' }));
+      }
+    });
+    return () => {
+      sub.remove();
+      loadTokenRef.current++;
+      releaseSound();
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   // timer
   useEffect(() => {
@@ -1077,6 +1335,7 @@ function AppContent() {
       else await stopLive();
       return;
     }
+    stopPlayback(); // the microphone and playback should not compete
     if (!(await ensureMic())) return;
     setText('');
     activeModeRef.current = batchMode ? 'batch' : 'live';
@@ -1215,29 +1474,48 @@ function AppContent() {
             <Text style={s.empty}>No transcripts match “{query.trim()}”.</Text>
           )}
           <View style={{ gap: 8 }}>
-            {visible.map(e => (
-              <Pressable
-                key={e.id}
-                onPress={() => openEntry(e)}
-                style={({ pressed }) => [s.card, pressed && { borderColor: C.faint }]}
-              >
-                <Text style={s.cardTitle} numberOfLines={1}>
-                  {e.title}
-                </Text>
-                <Text style={[s.mono9, { marginTop: 6 }]}>
-                  {e.status === 'failed' || e.status === 'untranscribed'
-                    ? `${e.duration} · NOT TRANSCRIBED · AUDIO SAVED`
-                    : e.words === 0
-                    ? `${e.duration} · NO SPEECH DETECTED${e.audioFile ? ' · AUDIO SAVED' : ''}`
-                    : `${e.duration} · ${e.words.toLocaleString()} WORDS${e.audioFile ? ' · AUDIO SAVED' : ''}`}
-                </Text>
-                {!!q && !e.title.toLowerCase().includes(q) && (
-                  <Text style={[s.mono9, { marginTop: 6, color: C.text }]} numberOfLines={2}>
-                    {snippetFor(e.text, q)}
-                  </Text>
-                )}
-              </Pressable>
-            ))}
+            {visible.map(e => {
+              const active = player.id === e.id && player.status !== 'idle';
+              const playing = active && player.status === 'playing';
+              return (
+                <View key={e.id} style={s.card}>
+                  <View style={{ flexDirection: 'row', alignItems: 'center', gap: 12 }}>
+                    <Pressable
+                      onPress={() => openEntry(e)}
+                      style={({ pressed }) => [{ flex: 1, minWidth: 0 }, pressed && { opacity: 0.7 }]}
+                    >
+                      <Text style={s.cardTitle} numberOfLines={1}>
+                        {e.title}
+                      </Text>
+                      <Text style={[s.mono9, { marginTop: 6 }]}>
+                        {e.status === 'failed' || e.status === 'untranscribed'
+                          ? `${e.duration} · NOT TRANSCRIBED`
+                          : e.words === 0
+                          ? `${e.duration} · NO SPEECH DETECTED`
+                          : `${e.duration} · ${e.words.toLocaleString()} WORDS`}
+                      </Text>
+                      {!!q && !e.title.toLowerCase().includes(q) && (
+                        <Text style={[s.mono9, { marginTop: 6, color: C.text }]} numberOfLines={2}>
+                          {snippetFor(e.text, q)}
+                        </Text>
+                      )}
+                    </Pressable>
+                    <PlayButton
+                      playing={playing}
+                      loading={active && player.status === 'loading'}
+                      disabled={!e.audioFile}
+                      onPress={() => togglePlay(e)}
+                      label={playing ? `Pause ${e.title}` : `Play ${e.title}`}
+                    />
+                  </View>
+                  {active && player.status !== 'loading' && (
+                    <View style={s.cardPlayer}>
+                      <SeekBar pos={player.pos} dur={player.dur} onSeek={seekTo} />
+                    </View>
+                  )}
+                </View>
+              );
+            })}
           </View>
         </View>
       </ScrollView>
@@ -1410,6 +1688,7 @@ function AppContent() {
                       ['React Native', 'MIT'],
                       ['react-native-fs', 'MIT'],
                       ['@react-native-documents/picker', 'MIT'],
+                      ['react-native-sound', 'MIT'],
                       ['@fugood/react-native-audio-pcm-stream', 'MIT'],
                     ].map(([name, lic], i) => (
                       <View key={name} style={[s.licRow, i > 0 && { borderTopWidth: 1, borderTopColor: C.borderSubtle }]}>
@@ -1520,6 +1799,22 @@ function AppContent() {
                   <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
                 </Pressable>
               </View>
+              {!!selected.audioFile && (
+                <View style={s.sheetPlayer}>
+                  <PlayButton
+                    playing={player.id === selected.id && player.status === 'playing'}
+                    loading={player.id === selected.id && player.status === 'loading'}
+                    disabled={false}
+                    onPress={() => togglePlay(selected)}
+                    label={player.id === selected.id && player.status === 'playing' ? 'Pause audio' : 'Play audio'}
+                  />
+                  {player.id === selected.id && (player.status === 'playing' || player.status === 'paused') ? (
+                    <SeekBar pos={player.pos} dur={player.dur} onSeek={seekTo} />
+                  ) : (
+                    <Text style={[s.mono9, { flex: 1 }]}>PLAY THE ORIGINAL AUDIO</Text>
+                  )}
+                </View>
+              )}
               {!!selected.segs && (
                 <View style={s.tsRow}>
                   <Text style={[s.mono9, { letterSpacing: 1.5 }]}>TIMESTAMPS</Text>
@@ -1633,6 +1928,22 @@ const s = StyleSheet.create({
     borderColor: C.border,
   },
   cardTitle: { fontSize: 14, fontWeight: '600', color: C.text },
+  cardPlayer: { marginTop: 12, paddingTop: 8, borderTopWidth: 1, borderTopColor: C.borderSubtle },
+  playBtn: { width: 32, height: 32, borderRadius: 16, borderWidth: 1, alignItems: 'center', justifyContent: 'center' },
+  seekHit: { height: 28, justifyContent: 'center' },
+  seekTrack: { height: 4, borderRadius: 2, backgroundColor: C.faint, overflow: 'hidden' },
+  seekThumb: { position: 'absolute', top: 8, width: 12, height: 12, borderRadius: 6, backgroundColor: C.amber, borderWidth: 2, borderColor: C.canvas },
+  seekTimes: { flexDirection: 'row', justifyContent: 'space-between' },
+  sheetPlayer: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    gap: 12,
+    paddingHorizontal: 20,
+    paddingVertical: 10,
+    backgroundColor: C.raised,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
 
   nav: {
     flexDirection: 'row',
