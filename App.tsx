@@ -1,13 +1,16 @@
-import React, { useRef, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import {
+  ActivityIndicator,
+  Modal,
+  PermissionsAndroid,
+  Pressable,
   SafeAreaView,
   ScrollView,
-  Text,
-  Button,
-  ActivityIndicator,
+  Share,
+  StatusBar,
   StyleSheet,
-  PermissionsAndroid,
   Switch,
+  Text,
   View,
 } from 'react-native';
 import RNFS from 'react-native-fs';
@@ -21,6 +24,24 @@ const REC_PATH = `${RNFS.ExternalDirectoryPath}/recording.wav`;
 const SAMPLE_RATE = 16000;
 const BYTES_PER_SEC = SAMPLE_RATE * 2; // 16-bit mono
 const MAX_SECONDS = 600; // batch recordings stop automatically at 10 minutes
+
+// Design tokens from the Figma file
+const C = {
+  canvas: '#0d0d0f',
+  surface: '#141417',
+  raised: '#1c1c21',
+  border: '#2a2a32',
+  borderSubtle: '#1e1e24',
+  amber: '#f5a623',
+  amberDim: '#f5a62330',
+  amberMuted: '#f5a62318',
+  green: '#34c97d',
+  text: '#e8e8ee',
+  muted: '#6b6b7a',
+  faint: '#3a3a45',
+  red: '#e05252',
+};
+const MONO = 'monospace'; // swap for Azeret Mono once the font is bundled
 
 const B64 = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/';
 
@@ -82,12 +103,77 @@ function toBytes(d: any): Uint8Array | null {
   return null;
 }
 
+const pad = (n: number) => String(n).padStart(2, '0');
+const fmt = (secs: number) => `${pad(Math.floor(secs / 60))}:${pad(Math.floor(secs % 60))}`;
+
+type Entry = {
+  id: string;
+  title: string;
+  date: string;
+  duration: string;
+  words: number;
+  text: string;
+};
+
+// ---------- small UI pieces ----------
+function Waveform({ active, levelRef }: { active: boolean; levelRef: React.MutableRefObject<number> }) {
+  const N = 40;
+  const [bars, setBars] = useState<number[]>(() => Array(N).fill(0.06));
+  useEffect(() => {
+    if (!active) {
+      setBars(Array(N).fill(0.06));
+      return;
+    }
+    const id = setInterval(() => {
+      const lvl = Math.min(1, levelRef.current * 4 + 0.08);
+      setBars(prev => [...prev.slice(1), Math.max(0.05, lvl * (0.6 + Math.random() * 0.4))]);
+    }, 80);
+    return () => clearInterval(id);
+  }, [active, levelRef]);
+  return (
+    <View style={s.wave}>
+      {bars.map((h, i) => (
+        <View
+          key={i}
+          style={{
+            width: 3,
+            height: `${h * 100}%`,
+            borderRadius: 2,
+            backgroundColor: active ? C.amber : C.faint,
+            opacity: active ? 0.85 + h * 0.15 : 0.5,
+          }}
+        />
+      ))}
+    </View>
+  );
+}
+
+function MenuRow(p: { icon: string; title: string; sub: string; onPress: () => void; right?: React.ReactNode }) {
+  return (
+    <Pressable onPress={p.onPress} style={({ pressed }) => [s.menuRow, pressed && { backgroundColor: '#ffffff0d' }]}>
+      <View style={s.menuIcon}>
+        <Text style={{ color: C.amber, fontSize: 16 }}>{p.icon}</Text>
+      </View>
+      <View style={{ flex: 1 }}>
+        <Text style={s.menuTitle}>{p.title}</Text>
+        <Text style={s.mono9}>{p.sub}</Text>
+      </View>
+      {p.right}
+    </Pressable>
+  );
+}
+
 export default function App() {
   const [status, setStatus] = useState('Ready');
-  const [text, setText] = useState('');
+  const [text, setText] = useState(''); // live preview only
   const [loading, setLoading] = useState(false);
   const [recording, setRecording] = useState(false);
   const [batchMode, setBatchMode] = useState(true);
+  const [elapsed, setElapsed] = useState(0);
+  const [entries, setEntries] = useState<Entry[]>([]);
+  const [selected, setSelected] = useState<Entry | null>(null);
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [freeHrs, setFreeHrs] = useState<number | null>(null);
 
   const ctxRef = useRef<any>(null);
   const transcriberRef = useRef<any>(null); // live mode
@@ -97,6 +183,48 @@ export default function App() {
   const lastSecRef = useRef(-1);
   const stoppingRef = useRef(false);
   const activeModeRef = useRef<'live' | 'batch'>('batch');
+  const liveTextRef = useRef('');
+  const elapsedRef = useRef(0);
+  const levelRef = useRef(0);
+
+  // timer
+  useEffect(() => {
+    if (!recording) return;
+    elapsedRef.current = 0;
+    setElapsed(0);
+    const id = setInterval(() => {
+      elapsedRef.current += 1;
+      setElapsed(elapsedRef.current);
+    }, 1000);
+    return () => clearInterval(id);
+  }, [recording]);
+
+  // recording time left, from free storage
+  useEffect(() => {
+    RNFS.getFSInfo()
+      .then(i => setFreeHrs(i.freeSpace / BYTES_PER_SEC / 3600))
+      .catch(() => {});
+  }, [recording, entries.length]);
+
+  const nextName = () => `untitled-${String(entries.length + 1).padStart(4, '0')}`;
+
+  const addEntry = (raw: string, secs: number, title?: string) => {
+    const t = raw.trim();
+    if (!t) {
+      setStatus('Done: no speech detected');
+      return;
+    }
+    const entry: Entry = {
+      id: String(Date.now()),
+      title: title ?? nextName(),
+      date: new Date().toISOString().slice(0, 10),
+      duration: fmt(secs),
+      words: t.split(/\s+/).length,
+      text: t,
+    };
+    setEntries(cur => [entry, ...cur]);
+    setSelected(entry);
+  };
 
   const getContext = async () => {
     if (!ctxRef.current) {
@@ -121,7 +249,6 @@ export default function App() {
   // ---------- test file ----------
   const transcribeFile = async () => {
     setLoading(true);
-    setText('');
     try {
       if (!(await RNFS.exists(AUDIO_PATH))) {
         throw new Error(`Audio not found at ${AUDIO_PATH}`);
@@ -131,7 +258,7 @@ export default function App() {
       const start = Date.now();
       const { promise } = ctx.transcribe(AUDIO_PATH, { language: 'en' });
       const { result } = await promise;
-      setText(result.trim());
+      addEntry(result, 11, 'jfk-test');
       setStatus(`Done in ${((Date.now() - start) / 1000).toFixed(1)}s`);
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);
@@ -144,6 +271,7 @@ export default function App() {
   const startLive = async () => {
     try {
       setText('');
+      liveTextRef.current = '';
       setLoading(true);
       const ctx = await getContext();
       setLoading(false);
@@ -153,7 +281,10 @@ export default function App() {
         {
           onTranscribe: (event: any) => {
             const t = event?.data?.result?.trim();
-            if (t) setText(prev => (prev ? prev + ' ' + t : t));
+            if (t) {
+              liveTextRef.current = liveTextRef.current ? liveTextRef.current + ' ' + t : t;
+              setText(liveTextRef.current);
+            }
           },
           onError: (err: any) => setStatus(`Error: ${err?.message ?? String(err)}`),
         },
@@ -177,6 +308,9 @@ export default function App() {
     transcriberRef.current = null;
     setRecording(false);
     setStatus('Stopped');
+    addEntry(liveTextRef.current, elapsedRef.current);
+    liveTextRef.current = '';
+    setText('');
   };
 
   // ---------- batch mode ----------
@@ -215,7 +349,7 @@ export default function App() {
       const start = Date.now();
       const { promise } = ctx.transcribe(REC_PATH, { language: 'en' });
       const { result } = await promise;
-      setText(result.trim());
+      addEntry(result, seconds);
       setStatus(
         `Done: ${seconds.toFixed(0)}s of audio transcribed in ${((Date.now() - start) / 1000).toFixed(1)}s`,
       );
@@ -228,7 +362,6 @@ export default function App() {
 
   const startBatch = async () => {
     try {
-      setText('');
       chunksRef.current = [];
       bytesRef.current = 0;
       lastSecRef.current = -1;
@@ -250,10 +383,22 @@ export default function App() {
         }
         chunksRef.current.push(b);
         bytesRef.current += b.length;
+
+        // loudness for the waveform
+        const dv = new DataView(b.buffer, b.byteOffset, b.byteLength);
+        let sum = 0;
+        let n = 0;
+        for (let i = 0; i + 1 < b.length; i += 32) {
+          const v = dv.getInt16(i, true) / 32768;
+          sum += v * v;
+          n++;
+        }
+        levelRef.current = n ? Math.sqrt(sum / n) : 0;
+
         const sec = Math.floor(bytesRef.current / BYTES_PER_SEC);
         if (sec !== lastSecRef.current) {
           lastSecRef.current = sec;
-          setStatus(`Recording... ${sec}s (tap Stop when done)`);
+          setStatus(`Recording... ${sec}s`);
         }
         if (sec >= MAX_SECONDS) stopBatch();
       });
@@ -261,13 +406,13 @@ export default function App() {
       adapterRef.current = adapter;
       await adapter.start();
       setRecording(true);
-      setStatus('Recording... 0s (tap Stop when done)');
+      setStatus('Recording... 0s');
     } catch (e: any) {
       setStatus(`Error: ${e?.message ?? String(e)}`);
     }
   };
 
-  // ---------- button ----------
+  // ---------- record button ----------
   const toggleRecording = async () => {
     if (recording) {
       if (activeModeRef.current === 'batch') await stopBatch();
@@ -275,49 +420,350 @@ export default function App() {
       return;
     }
     if (!(await ensureMic())) return;
+    setText('');
     activeModeRef.current = batchMode ? 'batch' : 'live';
     if (batchMode) await startBatch();
     else await startLive();
   };
 
-  return (
-    <SafeAreaView style={styles.container}>
-      <Text style={styles.title}>Offline Transcriber</Text>
+  const exportEntry = (e: Entry) =>
+    Share.share({ message: `${e.title}\n${e.date} · ${e.duration}\n\n${e.text}` });
 
-      <View style={styles.row}>
-        <Text style={styles.modeText}>
-          {batchMode ? 'Batch: transcribe after you stop' : 'Live: text while you speak'}
-        </Text>
-        <Switch value={batchMode} onValueChange={setBatchMode} disabled={recording || loading} />
+  const isError = status.startsWith('Error');
+
+  return (
+    <SafeAreaView style={s.container}>
+      <StatusBar barStyle="light-content" backgroundColor={C.canvas} />
+
+      {/* Header */}
+      <View style={s.header}>
+        <Text style={[s.mono10, { letterSpacing: 2, fontWeight: '500' }]}>TRANSCRIBE</Text>
+        <View style={s.headerRight}>
+          <Text style={s.mono10}>↓ OFFLINE</Text>
+          <View style={{ flexDirection: 'row', alignItems: 'flex-end', gap: 2 }}>
+            {[1, 2, 3, 4].map(b => (
+              <View
+                key={b}
+                style={{ width: 3, height: 8 + b * 2, borderRadius: 1, backgroundColor: b <= 3 ? C.text : C.faint }}
+              />
+            ))}
+          </View>
+        </View>
       </View>
 
-      <Button
-        title="Transcribe test file"
-        onPress={transcribeFile}
-        disabled={loading || recording}
-      />
-      <Button
-        title={recording ? 'Stop recording' : 'Record from microphone'}
-        onPress={toggleRecording}
-        disabled={loading}
-        color={recording ? '#c0392b' : undefined}
-      />
-      {loading && <ActivityIndicator style={styles.spinner} size="large" />}
-      <Text style={styles.status}>{status}</Text>
-      <ScrollView style={styles.box}>
-        <Text style={styles.result}>{text}</Text>
+      <ScrollView contentContainerStyle={{ paddingBottom: 24 }}>
+        {/* Record panel */}
+        <View
+          style={[
+            s.panel,
+            recording && { backgroundColor: C.amberMuted, borderColor: C.amberDim },
+          ]}
+        >
+          <View style={s.panelTop}>
+            <View>
+              <Text style={[s.label, { color: recording ? C.amber : C.muted }]}>
+                {recording ? 'RECORDING' : loading ? 'WORKING' : 'READY'}
+              </Text>
+              <Text style={s.timer}>{fmt(recording ? elapsed : 0)}</Text>
+            </View>
+            <Pressable
+              onPress={toggleRecording}
+              disabled={loading}
+              accessibilityLabel={recording ? 'Stop recording' : 'Start recording'}
+              style={({ pressed }) => [
+                s.recBtn,
+                {
+                  backgroundColor: recording ? C.amber : C.raised,
+                  borderColor: recording ? C.amber : C.faint,
+                  opacity: loading ? 0.4 : 1,
+                  transform: [{ scale: pressed ? 0.95 : 1 }],
+                },
+                recording && { shadowColor: C.amber, elevation: 10 },
+              ]}
+            >
+              {recording ? (
+                <View style={{ width: 16, height: 16, borderRadius: 3, backgroundColor: C.canvas }} />
+              ) : (
+                <View style={{ width: 18, height: 18, borderRadius: 9, backgroundColor: C.amber }} />
+              )}
+            </Pressable>
+          </View>
+
+          <Waveform active={recording} levelRef={levelRef} />
+
+          {!!text && recording && (
+            <Text style={s.livePreview} numberOfLines={4}>
+              {text}
+            </Text>
+          )}
+
+          <View style={s.statusRow}>
+            {loading && <ActivityIndicator size="small" color={C.amber} />}
+            <Text style={[s.mono10, { flex: 1, color: isError ? C.red : C.muted }]}>{status}</Text>
+          </View>
+
+          <View style={s.panelFoot}>
+            <Text style={s.mono10}>{nextName().toUpperCase()}</Text>
+            <View style={{ alignItems: 'flex-end' }}>
+              <Text style={s.hours}>{freeHrs === null ? '--' : freeHrs.toFixed(2)} HRS</Text>
+              <Text style={s.mono9}>RECORDING TIME LEFT</Text>
+            </View>
+          </View>
+        </View>
+
+        {/* Recent */}
+        <View style={{ paddingHorizontal: 16, marginTop: 24 }}>
+          <Text style={[s.mono10, { letterSpacing: 2, fontWeight: '500', marginBottom: 12 }]}>RECENT</Text>
+          {entries.length === 0 && (
+            <Text style={s.empty}>No transcripts yet. Tap the record button to make your first one.</Text>
+          )}
+          <View style={{ gap: 8 }}>
+            {entries.map(e => (
+              <Pressable
+                key={e.id}
+                onPress={() => setSelected(e)}
+                style={({ pressed }) => [s.card, pressed && { borderColor: C.faint }]}
+              >
+                <Text style={s.cardTitle} numberOfLines={1}>
+                  {e.title}
+                </Text>
+                <Text style={[s.mono9, { marginTop: 6 }]}>
+                  {e.duration} · {e.words.toLocaleString()} WORDS
+                </Text>
+              </Pressable>
+            ))}
+          </View>
+        </View>
       </ScrollView>
+
+      {/* Bottom nav */}
+      <View style={s.nav}>
+        <View style={s.navItem}>
+          <Text style={{ color: C.amber, fontSize: 16 }}>▤</Text>
+          <Text style={[s.mono9, { color: C.amber, letterSpacing: 1 }]}>HOME</Text>
+        </View>
+        <Pressable onPress={() => setMenuOpen(true)} accessibilityLabel="Add audio" style={s.fab}>
+          <Text style={{ color: C.amber, fontSize: 28, lineHeight: 30 }}>+</Text>
+        </Pressable>
+        <View style={s.navItem} />
+      </View>
+
+      {/* Add audio menu */}
+      <Modal visible={menuOpen} transparent animationType="fade" onRequestClose={() => setMenuOpen(false)}>
+        <View style={s.modalEnd}>
+          <Pressable style={s.backdrop} onPress={() => setMenuOpen(false)} />
+          <View style={s.menu}>
+            <View style={s.menuHead}>
+              <Text style={[s.mono9, { letterSpacing: 2 }]}>ADD AUDIO</Text>
+              <Text style={s.menuTitle}>Choose a source</Text>
+            </View>
+            <View style={{ padding: 8 }}>
+              <MenuRow
+                icon="↓"
+                title="Transcribe test file"
+                sub="JFK SAMPLE ON DEVICE"
+                onPress={() => {
+                  setMenuOpen(false);
+                  transcribeFile();
+                }}
+              />
+              <MenuRow
+                icon="∿"
+                title="Toggle real-time"
+                sub="LIVE TRANSCRIPTION"
+                onPress={() => !recording && !loading && setBatchMode(v => !v)}
+                right={
+                  <Switch
+                    value={!batchMode}
+                    onValueChange={v => setBatchMode(!v)}
+                    disabled={recording || loading}
+                    trackColor={{ false: C.faint, true: C.amber }}
+                    thumbColor={C.canvas}
+                  />
+                }
+              />
+              <MenuRow
+                icon="●"
+                title="New recording"
+                sub="START CAPTURING NOW"
+                onPress={() => {
+                  setMenuOpen(false);
+                  if (!recording && !loading) toggleRecording();
+                }}
+              />
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      {/* Transcript sheet */}
+      <Modal visible={!!selected} transparent animationType="slide" onRequestClose={() => setSelected(null)}>
+        <View style={s.modalEnd}>
+          <Pressable style={s.backdrop} onPress={() => setSelected(null)} />
+          {selected && (
+            <View style={s.sheet}>
+              <View style={s.handle} />
+              <View style={s.sheetHead}>
+                <View style={{ flex: 1 }}>
+                  <Text style={[s.mono9, { color: C.amber, letterSpacing: 2 }]}>TRANSCRIPT</Text>
+                  <Text style={[s.menuTitle, { fontSize: 16, marginTop: 4 }]} numberOfLines={1}>
+                    {selected.title}
+                  </Text>
+                  <Text style={[s.mono9, { marginTop: 4 }]}>
+                    {selected.date} · {selected.duration} · {selected.words.toLocaleString()} WORDS
+                  </Text>
+                </View>
+                <Pressable onPress={() => exportEntry(selected)} style={s.exportBtn}>
+                  <Text style={[s.mono9, { color: C.amber }]}>↑ EXPORT</Text>
+                </Pressable>
+              </View>
+              <ScrollView style={{ paddingHorizontal: 20 }} contentContainerStyle={{ paddingVertical: 20 }}>
+                <Text style={s.transcript} selectable>
+                  {selected.text}
+                </Text>
+              </ScrollView>
+            </View>
+          )}
+        </View>
+      </Modal>
     </SafeAreaView>
   );
 }
 
-const styles = StyleSheet.create({
-  container: { flex: 1, padding: 20, gap: 12 },
-  title: { fontSize: 24, fontWeight: 'bold' },
-  row: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
-  modeText: { fontSize: 15, flex: 1 },
-  spinner: { marginVertical: 8 },
-  status: { fontSize: 14, color: '#555' },
-  box: { flex: 1, borderWidth: 1, borderColor: '#ccc', borderRadius: 8, padding: 10 },
-  result: { fontSize: 18 },
+const s = StyleSheet.create({
+  container: { flex: 1, backgroundColor: C.canvas },
+  header: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingHorizontal: 20,
+    paddingTop: 16,
+    paddingBottom: 8,
+    borderBottomWidth: 1,
+    borderBottomColor: C.borderSubtle,
+  },
+  headerRight: { flexDirection: 'row', alignItems: 'center', gap: 12 },
+  mono10: { fontFamily: MONO, fontSize: 10, color: C.muted },
+  mono9: { fontFamily: MONO, fontSize: 9, color: C.muted },
+
+  panel: {
+    marginHorizontal: 16,
+    marginTop: 16,
+    padding: 20,
+    gap: 16,
+    borderRadius: 16,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  panelTop: { flexDirection: 'row', alignItems: 'center', justifyContent: 'space-between' },
+  label: { fontSize: 12, fontWeight: '500', marginBottom: 2 },
+  timer: { fontFamily: MONO, fontSize: 30, fontWeight: '300', color: C.text },
+  recBtn: {
+    width: 56,
+    height: 56,
+    borderRadius: 28,
+    borderWidth: 2,
+    alignItems: 'center',
+    justifyContent: 'center',
+  },
+  wave: { height: 40, flexDirection: 'row', alignItems: 'center', justifyContent: 'center', gap: 2 },
+  livePreview: { fontFamily: MONO, fontSize: 12, lineHeight: 20, color: C.text },
+  statusRow: { flexDirection: 'row', alignItems: 'center', gap: 8 },
+  panelFoot: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-between',
+    paddingTop: 12,
+    borderTopWidth: 1,
+    borderTopColor: C.borderSubtle,
+  },
+  hours: { fontFamily: MONO, fontSize: 14, fontWeight: '500', color: C.text },
+
+  empty: { fontSize: 13, lineHeight: 20, color: C.muted },
+  card: {
+    paddingHorizontal: 16,
+    paddingVertical: 14,
+    borderRadius: 12,
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  cardTitle: { fontSize: 14, fontWeight: '600', color: C.text },
+
+  nav: {
+    flexDirection: 'row',
+    alignItems: 'center',
+    justifyContent: 'space-around',
+    paddingVertical: 16,
+    backgroundColor: C.canvas,
+    borderTopWidth: 1,
+    borderTopColor: C.border,
+  },
+  navItem: { flex: 1, alignItems: 'center', gap: 4 },
+  fab: {
+    width: 52,
+    height: 52,
+    marginTop: -20,
+    borderRadius: 26,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: C.raised,
+    borderWidth: 1.5,
+    borderColor: C.faint,
+  },
+
+  modalEnd: { flex: 1, justifyContent: 'flex-end' },
+  backdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: '#000000a6' },
+  menu: {
+    marginHorizontal: 16,
+    marginBottom: 96,
+    borderRadius: 16,
+    overflow: 'hidden',
+    backgroundColor: C.raised,
+    borderWidth: 1,
+    borderColor: C.faint,
+  },
+  menuHead: { paddingHorizontal: 16, paddingVertical: 12, borderBottomWidth: 1, borderBottomColor: C.border },
+  menuTitle: { fontSize: 14, fontWeight: '600', color: C.text },
+  menuRow: { flexDirection: 'row', alignItems: 'center', gap: 12, padding: 12, borderRadius: 12 },
+  menuIcon: {
+    width: 40,
+    height: 40,
+    borderRadius: 12,
+    alignItems: 'center',
+    justifyContent: 'center',
+    backgroundColor: C.amberMuted,
+  },
+
+  sheet: {
+    maxHeight: '82%',
+    borderTopLeftRadius: 24,
+    borderTopRightRadius: 24,
+    overflow: 'hidden',
+    backgroundColor: C.surface,
+    borderWidth: 1,
+    borderBottomWidth: 0,
+    borderColor: C.faint,
+  },
+  handle: { alignSelf: 'center', width: 40, height: 4, borderRadius: 2, marginVertical: 10, backgroundColor: C.faint },
+  sheetHead: {
+    flexDirection: 'row',
+    alignItems: 'flex-start',
+    gap: 16,
+    paddingHorizontal: 20,
+    paddingBottom: 16,
+    borderBottomWidth: 1,
+    borderBottomColor: C.border,
+  },
+  exportBtn: {
+    paddingHorizontal: 10,
+    height: 32,
+    borderRadius: 16,
+    alignItems: 'center',
+    justifyContent: 'center',
+    borderWidth: 1,
+    borderColor: C.border,
+  },
+  transcript: { fontFamily: MONO, fontSize: 12, lineHeight: 24, color: C.text },
 });
